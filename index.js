@@ -305,6 +305,12 @@ const Interceptor = {
             if (body[key] === undefined) delete body[key];
         }
 
+        // temperature와 top_p 동시 전송 방지 (Copilot/Anthropic 공통)
+        if (body.temperature != null && body.top_p != null) {
+            DebugLog.warn(`top_p 제거 (temperature=${body.temperature}와 동시 사용 불가)`);
+            delete body.top_p;
+        }
+
         if (isAnthropic) {
             // === Anthropic 포맷 변환 ===
             DebugLog.info("OpenAI → Anthropic 포맷 변환 중...");
@@ -322,6 +328,21 @@ const Interceptor = {
 
         } else {
             // === OpenAI 포맷 보정 ===
+
+            // SillyTavern 전용 파라미터 정리
+            delete body.chat_completion_source;
+            delete body.user_name;
+            delete body.char_name;
+            delete body.group_names;
+            delete body.include_reasoning;
+            delete body.reasoning_effort;
+            delete body.enable_web_search;
+            delete body.request_images;
+            delete body.custom_prompt_post_processing;
+            delete body.custom_include_body;
+            delete body.custom_exclude_body;
+            delete body.custom_include_headers;
+            delete body.type;
 
             // 프리필 제거
             if (s.removePrefill && body.messages?.length > 0) {
