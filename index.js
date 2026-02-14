@@ -130,9 +130,30 @@ function getToken(requestBody) {
             return _cachedApiKey;
         }
     }
-    // 2. 캐시된 토큰
+    // 2. custom_include_headers에서 Authorization 추출
+    const headers = requestBody?.custom_include_headers;
+    if (headers && typeof headers === "object") {
+        const auth = headers["Authorization"] || headers["authorization"];
+        if (auth) {
+            const token = auth.replace(/^Bearer\s+/i, "").trim();
+            if (token) {
+                _cachedApiKey = token;
+                DebugLog.info(`토큰: custom_include_headers (${token.substring(0, 10)}...)`);
+                return _cachedApiKey;
+            }
+        }
+        // key 필드로도 체크
+        for (const [k, v] of Object.entries(headers)) {
+            if (typeof v === "string" && v.startsWith("gho_")) {
+                _cachedApiKey = v.trim();
+                DebugLog.info(`토큰: custom_include_headers.${k} (${v.substring(0, 10)}...)`);
+                return _cachedApiKey;
+            }
+        }
+    }
+    // 3. 캐시된 토큰
     if (_cachedApiKey) return _cachedApiKey;
-    // 3. GCM 폴백
+    // 4. GCM 폴백
     const gcm = extension_settings["GCM"]?.token;
     if (gcm) {
         DebugLog.info(`토큰: GCM 폴백 (${gcm.substring(0, 10)}...)`);
