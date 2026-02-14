@@ -120,15 +120,29 @@ function escapeHtml(s) {
 let _cachedApiKey = "";
 
 function getToken(requestBody) {
-    const apiKey = requestBody?.api_key_custom;
-    if (apiKey && typeof apiKey === "string" && apiKey.trim()) {
-        _cachedApiKey = apiKey.trim();
+    // 1. SillyTavern 연결 프로필 API key 필드
+    const fields = ['api_key_custom', 'api_key', 'reverse_proxy_password', 'proxy_password'];
+    for (const f of fields) {
+        const val = requestBody?.[f];
+        if (val && typeof val === "string" && val.trim()) {
+            _cachedApiKey = val.trim();
+            DebugLog.info(`토큰: ${f} (${val.substring(0, 10)}...)`);
+            return _cachedApiKey;
+        }
     }
-    return _cachedApiKey;
+    // 2. 캐시된 토큰
+    if (_cachedApiKey) return _cachedApiKey;
+    // 3. GCM 폴백
+    const gcm = extension_settings["GCM"]?.token;
+    if (gcm) {
+        DebugLog.info(`토큰: GCM 폴백 (${gcm.substring(0, 10)}...)`);
+        return gcm;
+    }
+    return "";
 }
 
 function hasAnyToken() {
-    return !!_cachedApiKey;
+    return !!(_cachedApiKey || extension_settings["GCM"]?.token);
 }
 
 function getSettings() {
@@ -280,7 +294,7 @@ const Interceptor = {
 
     async interceptAndSend(requestBody) {
         const token = getToken(requestBody);
-        if (!token) throw new Error("토큰 없음 — 연결 프로필의 API key에 Copilot 토큰을 입력하세요");
+        if (!token) throw new Error("토큰 없음 — API key 또는 GCM 토큰 필요");
 
         const s = getSettings();
         const isAnthropic = s.endpoint === "anthropic";
@@ -548,7 +562,9 @@ const Interceptor = {
             } catch { return self.originalFetch.apply(window, args); }
 
             if (!(requestBody.custom_url || "").includes("githubcopilot.com")) return self.originalFetch.apply(window, args);
-            if (!hasAnyToken() && !requestBody.api_key_custom) { DebugLog.warn("토큰 없음 (API key 또는 GCM 필요)"); return self.originalFetch.apply(window, args); }
+            
+            const token = getToken(requestBody);
+            if (!token) { DebugLog.warn("토큰 없음 — API key 또는 GCM 필요"); return self.originalFetch.apply(window, args); }
 
             DebugLog.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
             DebugLog.info("Copilot 요청 인터셉트!");
@@ -592,7 +608,7 @@ function updateStatus() {
     if (!s.enabled) {
         el.text("❌ 비활성").css("color", "#f44336");
     } else if (!hasAnyToken()) {
-        el.text("⚠️ 토큰 없음 — 연결 프로필의 API key에 토큰 입력 필요").css("color", "#FF9800");
+        el.text("⚠️ 토큰 없음 — API key 입력 또는 GCM 발급 필요").css("color", "#FF9800");
     } else if (Interceptor.active) {
         el.text(`✅ 활성 — ${s.endpoint === "anthropic" ? "Anthropic (/v1/messages)" : s.endpoint === "passthrough" ? "패스스루 (/chat/completions)" : "OpenAI (/chat/completions)"}`).css("color", "#4CAF50");
     } else {
