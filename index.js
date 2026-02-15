@@ -380,8 +380,23 @@ const Interceptor = {
         }
 
         if (isPassthrough) {
-            // === 패스스루: 최소한의 정리만 하고 그대로 전달 ===
-            DebugLog.info("패스스루 모드: 변환 없이 그대로 전달");
+            // === 패스스루: SillyTavern 전용 파라미터만 제거하고 그대로 전달 ===
+            delete body.chat_completion_source;
+            delete body.user_name;
+            delete body.char_name;
+            delete body.group_names;
+            delete body.include_reasoning;
+            delete body.reasoning_effort;
+            delete body.enable_web_search;
+            delete body.request_images;
+            delete body.request_image_resolution;
+            delete body.request_image_aspect_ratio;
+            delete body.custom_prompt_post_processing;
+            delete body.custom_include_body;
+            delete body.custom_exclude_body;
+            delete body.custom_include_headers;
+            delete body.type;
+            DebugLog.info("패스스루 모드: SillyTavern 파라미터 정리 후 전달");
 
         } else if (isAnthropic) {
             // === Anthropic 포맷 변환 ===
