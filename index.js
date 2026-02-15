@@ -182,7 +182,7 @@ function getSettings() {
 function saveSettings() { saveSettingsDebounced(); }
 
 // ============================================================
-// OpenAI → Anthropic 포맷 변환 (LBI buildClaudeBodyCore 참고)
+// OpenAI → Anthropic 포맷 변환
 // ============================================================
 function convertToAnthropicFormat(messages, model, params) {
     const openAIChats = structuredClone(messages);
