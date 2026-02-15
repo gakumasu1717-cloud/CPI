@@ -188,11 +188,8 @@ function convertToAnthropicFormat(messages, model, params) {
     const openAIChats = structuredClone(messages);
 
     // 1) 첫 assistant 등장 전까지의 메시지를 system 파라미터로 추출
-    //    SillyTavern strict 모드가 system→user로 바꿀 수 있으므로
-    //    첫 assistant 이전의 user/system 모두 system으로 취급
     let splitIndex = openAIChats.findIndex(m => m.role === "assistant");
     if (splitIndex === -1) {
-        // assistant가 없으면 마지막 메시지 하나는 남김
         splitIndex = Math.max(0, openAIChats.length - 1);
     }
 
@@ -200,6 +197,7 @@ function convertToAnthropicFormat(messages, model, params) {
     for (let i = 0; i < splitIndex; i++) {
         const content = typeof openAIChats[i].content === "string"
             ? openAIChats[i].content.trim() : "";
+        if (!content) continue;
         if (systemText) systemText += "\n\n";
         systemText += content;
     }
@@ -214,10 +212,10 @@ function convertToAnthropicFormat(messages, model, params) {
     const anthropicMessages = [];
     for (const msg of openAIChats) {
         const content = (typeof msg.content === "string" ? msg.content : "").trim();
+        if (!content) continue;  // 빈 메시지 스킵
         const last = anthropicMessages.length > 0 ? anthropicMessages[anthropicMessages.length - 1] : null;
 
         if (msg.role === "system") {
-            // system → user로 변환, "system: " 접두사 붙임
             const text = "system: " + content;
             if (last?.role === "user") {
                 last.content[0].text += "\n\n" + text;
@@ -233,15 +231,31 @@ function convertToAnthropicFormat(messages, model, params) {
         }
     }
 
-    // 4) 마지막이 user인지 확인
-    if (anthropicMessages.length > 0 && anthropicMessages[anthropicMessages.length - 1].role !== "user") {
+    // 4) messages가 비어있으면 더미
+    if (anthropicMessages.length === 0) {
+        anthropicMessages.push({ role: "user", content: [{ type: "text", text: "Start" }] });
+    }
+
+    // 5) 마지막이 user인지 확인
+    if (anthropicMessages[anthropicMessages.length - 1].role !== "user") {
         anthropicMessages.push({ role: "user", content: [{ type: "text", text: "Continue" }] });
     }
 
-    // 5) body 구성
+    // 6) user↔assistant 교대 검증 — 연속 같은 role 있으면 병합
+    const validated = [];
+    for (const msg of anthropicMessages) {
+        const last = validated.length > 0 ? validated[validated.length - 1] : null;
+        if (last && last.role === msg.role) {
+            last.content[0].text += "\n\n" + msg.content[0].text;
+        } else {
+            validated.push(msg);
+        }
+    }
+
+    // 7) body 구성
     const body = {
         model: model,
-        messages: anthropicMessages,
+        messages: validated,
         max_tokens: params.max_tokens || 8192,
     };
 
@@ -249,10 +263,14 @@ function convertToAnthropicFormat(messages, model, params) {
         body.system = [{ type: "text", text: systemText }];
     }
 
-    if (params.temperature != null) body.temperature = params.temperature;
-    // Anthropic API: temperature와 top_p를 동시에 보내면 안 됨
-    // temperature가 없을 때만 top_p 전송
-    if (params.temperature == null && params.top_p != null) body.top_p = params.top_p;
+    // temperature 클램핑 (Anthropic: 0.0~1.0)
+    if (params.temperature != null) {
+        body.temperature = Math.min(Math.max(params.temperature, 0), 1.0);
+    }
+    // top_p: temperature 없을 때만
+    if (params.temperature == null && params.top_p != null) {
+        body.top_p = Math.min(Math.max(params.top_p, 0), 1.0);
+    }
     if (params.stream != null) body.stream = params.stream;
 
     return body;
