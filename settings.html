@@ -15,8 +15,18 @@
             <!-- 토큰 설정 -->
             <div class="cpi-section">
                 <h4><i class="fa-solid fa-key"></i> Copilot 토큰</h4>
-                <input id="cpi_token" type="password" class="text_pole" placeholder="gho_xxxx... (비워두면 GCM 폴백)" style="font-size:13px;" />
-                <small class="cpi-dim">직접 입력한 토큰이 우선, 비어있으면 GCM에서 자동으로 가져옴</small>
+                <select id="cpi_token_select" class="text_pole" style="font-size:13px;margin-bottom:6px;">
+                    <option value="">-- 토큰 선택 (비어있으면 GCM 폴백) --</option>
+                </select>
+                <div style="display:flex;gap:4px;margin-bottom:8px;">
+                    <input id="cpi_token_name" type="text" class="text_pole" placeholder="이름 (예: 메인계정)" style="font-size:12px;flex:1;" />
+                    <input id="cpi_token_value" type="password" class="text_pole" placeholder="gho_xxxx..." style="font-size:12px;flex:2;" />
+                </div>
+                <div style="display:flex;gap:4px;">
+                    <input id="cpi_token_add" class="menu_button" type="button" value="➕ 추가" style="font-size:11px;padding:3px 10px;" />
+                    <input id="cpi_token_delete" class="menu_button" type="button" value="🗑️ 삭제" style="font-size:11px;padding:3px 10px;" />
+                </div>
+                <small class="cpi-dim">토큰을 저장하고 드롭다운에서 전환. 비어있으면 GCM 폴백.</small>
             </div>
 
             <hr class="sysHR" />
@@ -26,10 +36,28 @@
                 <h4><i class="fa-solid fa-route"></i> 엔드포인트</h4>
                 <select id="cpi_endpoint" class="text_pole" style="font-size:13px;">
                     <option value="anthropic">Anthropic (/v1/messages) — 클로드 권장</option>
+                    <option value="anthropic-thinking">Anthropic 추론 (/v1/messages) — 확장 추론</option>
                     <option value="openai">OpenAI (/chat/completions) — 클로드 호환</option>
                     <option value="passthrough">패스스루 (/chat/completions) — 변환 없이 그대로 (제미니 등)</option>
                 </select>
-                <small class="cpi-dim">Anthropic: system role 완벽 지원, 클로드 네이티브 포맷<br>OpenAI: 호환성 높지만 system 처리가 다를 수 있음<br>패스스루: 인증/헤더만 처리, body 변환 없음</small>
+                <small class="cpi-dim">Anthropic: system role 완벽 지원, 클로드 네이티브 포맷<br>Anthropic 추론: 확장 추론 활성화 (temperature 무시)<br>OpenAI: 호환성 높지만 system 처리가 다를 수 있음<br>패스스루: 인증/헤더만 처리, body 변환 없음</small>
+            </div>
+
+            <hr class="sysHR" />
+
+            <!-- 추론 Budget (Anthropic 추론 전용) -->
+            <div class="cpi-section cpi-thinking-only">
+                <h4><i class="fa-solid fa-brain"></i> 추론 설정 (Anthropic)</h4>
+                <div class="cpi-version-row">
+                    <label for="cpi_adaptive_thinking">Adaptive Thinking:</label>
+                    <input id="cpi_adaptive_thinking" type="checkbox" />
+                    <small class="cpi-dim" style="margin-left:8px;">모델이 추론 깊이를 자동 결정 (Opus 4.6+, Copilot 미지원 가능)</small>
+                </div>
+                <div class="cpi-version-row cpi-budget-row">
+                    <label for="cpi_thinking_budget">Budget 토큰:</label>
+                    <input id="cpi_thinking_budget" type="number" class="text_pole" value="10000" min="1000" max="100000" step="1000" placeholder="10000" />
+                </div>
+                <small class="cpi-dim">Adaptive OFF: 고정 budget 사용. Adaptive ON: budget 무시, 모델이 자동 조절.</small>
             </div>
 
             <hr class="sysHR" />
@@ -86,11 +114,11 @@
                 <h4><i class="fa-solid fa-code-branch"></i> 버전</h4>
                 <div class="cpi-version-row">
                     <label for="cpi_chat_version">Copilot Chat:</label>
-                    <input id="cpi_chat_version" type="text" class="text_pole" value="0.26.4" placeholder="0.26.4" />
+                    <input id="cpi_chat_version" type="text" class="text_pole" value="0.38.2026020704" placeholder="0.38.2026020704" />
                 </div>
                 <div class="cpi-version-row">
                     <label for="cpi_code_version">VSCode:</label>
-                    <input id="cpi_code_version" type="text" class="text_pole" value="1.100.0" placeholder="1.100.0" />
+                    <input id="cpi_code_version" type="text" class="text_pole" value="1.109.0" placeholder="1.109.0" />
                 </div>
                 <input id="cpi_reset_session" class="menu_button" type="button" value="🔄 세션 초기화" style="margin-top:6px;" />
             </div>
@@ -105,7 +133,11 @@
                         <input id="cpi_debug_log" type="checkbox" checked />
                         <span>로그 표시</span>
                     </label>
-                    <input id="cpi_clear_log" class="menu_button" type="button" value="🗑️ 초기화" style="width:auto;padding:2px 10px;font-size:11px;" />
+                    <div style="display:flex;gap:4px;">
+                        <input id="cpi_fold_all" class="menu_button" type="button" value="📁 모두 접기" style="width:auto;padding:2px 8px;font-size:11px;" />
+                        <input id="cpi_scroll_bottom" class="menu_button" type="button" value="⬇ 맨아래" style="width:auto;padding:2px 8px;font-size:11px;" />
+                        <input id="cpi_clear_log" class="menu_button" type="button" value="🗑️ 초기화" style="width:auto;padding:2px 10px;font-size:11px;" />
+                    </div>
                 </div>
                 <div id="cpi_log_panel">
                     <div id="cpi_log_content" class="cpi-log-box">

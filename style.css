@@ -17,3 +17,8 @@
 .cpi-log-box::-webkit-scrollbar { width: 6px; }
 .cpi-log-box::-webkit-scrollbar-track { background: #0d1117; }
 .cpi-log-box::-webkit-scrollbar-thumb { background: #333; border-radius: 3px; }
+.cpi-fold-preview, .cpi-fold-full { word-break: break-all; }
+.cpi-fold-btn { font-size: 10px; user-select: none; }
+.cpi-fold-btn:hover { text-decoration: underline; }
+.cpi-fold-long { background: #161b22; border-left: 2px solid #30363d; padding: 4px 8px; margin: 4px 0; }
+.cpi-token-row { display: flex; gap: 4px; margin-bottom: 6px; }

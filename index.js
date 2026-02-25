@@ -17,10 +17,14 @@ const defaultSettings = {
     forceLastUser: true,
     basicAuthCompat: false,
     debugLog: true,
-    endpoint: "anthropic",  // "openai", "anthropic", "passthrough"
-    token: "",  // 직접 입력한 Copilot 토큰 (비어있으면 GCM 폴백)
-    chatVersion: "0.26.4",
-    codeVersion: "1.100.0",
+    endpoint: "anthropic",  // "openai", "anthropic", "anthropic-thinking", "passthrough"
+    thinkingBudget: 10000,  // thinking budget_tokens
+    adaptiveThinking: false, // adaptive thinking (Opus 4.6+, Copilot 미지원 가능)
+
+    token: "",  // 현재 선택된 토큰
+    tokens: [],  // 저장된 토큰 목록 [{name, value}]
+    chatVersion: "0.38.2026020704",
+    codeVersion: "1.109.0",
 };
 
 const LOG_MAX = 500;
@@ -98,13 +102,25 @@ const DebugLog = {
         const el = $("#cpi_log_content");
         if (!el.length) return;
         const colors = { INFO: "#8bc34a", WARN: "#FF9800", ERROR: "#f44336", REQ: "#64b5f6", RES: "#ce93d8" };
-        const html = this.entries.map(e => {
+        const FOLD_THRESHOLD = 200;
+        const html = this.entries.map((e, idx) => {
             const c = colors[e.level] || "#ccc";
-            const f = escapeHtml(e.msg).replace(/\n/g, "<br>");
-            return `<div style="margin:1px 0;"><span style="color:#666;">[${e.time}]</span> <span style="color:${c};font-weight:bold;">[${e.level}]</span> <span style="color:#ddd;">${f}</span></div>`;
+            const escaped = escapeHtml(e.msg);
+            const needsFold = escaped.length > FOLD_THRESHOLD;
+            const header = `<span style="color:#666;">[${e.time}]</span> <span style="color:${c};font-weight:bold;">[${e.level}]</span> `;
+            if (needsFold) {
+                const preview = escaped.substring(0, FOLD_THRESHOLD).replace(/\n/g, "<br>");
+                const full = escaped.replace(/\n/g, "<br>");
+                return `<div style="margin:1px 0;">${header}<span class="cpi-fold" data-idx="${idx}"><span class="cpi-fold-short" style="color:#ddd;">${preview}<span class="cpi-fold-btn" data-action="expand" style="color:#64b5f6;cursor:pointer;margin-left:4px;">▼ 펼치기</span></span><span class="cpi-fold-long" style="display:none;color:#ddd;">${full}<br><span class="cpi-fold-btn" data-action="collapse" style="color:#64b5f6;cursor:pointer;">▲ 접기</span></span></span></div>`;
+            }
+            const f = escaped.replace(/\n/g, "<br>");
+            return `<div style="margin:1px 0;">${header}<span style="color:#ddd;">${f}</span></div>`;
         }).join("");
         el.html(html);
-        el.scrollTop(el[0]?.scrollHeight || 0);
+        // 자동 스크롤 (맨 아래로)
+        requestAnimationFrame(() => {
+            el.scrollTop(el[0]?.scrollHeight || 0);
+        });
     },
 
     clear() { this.entries = []; this.render(); },
@@ -138,7 +154,7 @@ function getToken(requestBody) {
     }
     // 2. custom_include_headers에서 Authorization 추출
     const headers = requestBody?.custom_include_headers;
-    if (headers && typeof headers === "object") {
+    if (headers && typeof headers === "object" && !Array.isArray(headers)) {
         const auth = headers["Authorization"] || headers["authorization"];
         if (auth) {
             const token = auth.replace(/^Bearer\s+/i, "").trim();
@@ -184,6 +200,7 @@ function saveSettings() { saveSettingsDebounced(); }
 // ============================================================
 // OpenAI → Anthropic 포맷 변환
 // ============================================================
+// ============================================================
 function convertToAnthropicFormat(messages, model, params) {
     const openAIChats = structuredClone(messages);
 
@@ -211,7 +228,12 @@ function convertToAnthropicFormat(messages, model, params) {
     // 3) messages 변환 (같은 role 연속 병합 + system→user 변환)
     const anthropicMessages = [];
     for (const msg of openAIChats) {
-        const content = (typeof msg.content === "string" ? msg.content : "").trim();
+        let content = "";
+        if (typeof msg.content === "string") {
+            content = msg.content.trim();
+        } else if (Array.isArray(msg.content)) {
+            content = msg.content.map(b => b.text || "").join("").trim();
+        }
         if (!content) continue;  // 빈 메시지 스킵
         const last = anthropicMessages.length > 0 ? anthropicMessages[anthropicMessages.length - 1] : null;
 
@@ -244,12 +266,23 @@ function convertToAnthropicFormat(messages, model, params) {
     // 6) user↔assistant 교대 검증 — 연속 같은 role 있으면 병합
     const validated = [];
     for (const msg of anthropicMessages) {
+        const text = msg.content[0]?.text?.trim();
+        if (!text) continue;  // 빈 text 최종 제거
+        msg.content[0].text = text;
         const last = validated.length > 0 ? validated[validated.length - 1] : null;
         if (last && last.role === msg.role) {
-            last.content[0].text += "\n\n" + msg.content[0].text;
+            last.content[0].text += "\n\n" + text;
         } else {
             validated.push(msg);
         }
+    }
+
+    // 검증 후 비어있으면 더미
+    if (validated.length === 0) {
+        validated.push({ role: "user", content: [{ type: "text", text: "Start" }] });
+    }
+    if (validated[validated.length - 1].role !== "user") {
+        validated.push({ role: "user", content: [{ type: "text", text: "Continue" }] });
     }
 
     // 7) body 구성
@@ -263,13 +296,28 @@ function convertToAnthropicFormat(messages, model, params) {
         body.system = [{ type: "text", text: systemText }];
     }
 
-    // temperature 클램핑 (Anthropic: 0.0~1.0)
-    if (params.temperature != null) {
-        body.temperature = Math.min(Math.max(params.temperature, 0), 1.0);
-    }
-    // top_p: temperature 없을 때만
-    if (params.temperature == null && params.top_p != null) {
-        body.top_p = Math.min(Math.max(params.top_p, 0), 1.0);
+    // thinking 모드
+    if (params.thinking) {
+        if (params.adaptiveThinking) {
+            body.thinking = { type: "adaptive" };
+            DebugLog.info("Adaptive Thinking 활성화");
+        } else {
+            const budget = params.thinkingBudget || 10000;
+            body.thinking = { type: "enabled", budget_tokens: budget };
+            if (body.max_tokens <= budget) {
+                body.max_tokens = budget + 4096;
+            }
+        }
+        // thinking 사용 시 temperature 설정 불가 (Anthropic 제한)
+    } else {
+        // temperature 클램핑 (Anthropic: 0.0~1.0)
+        if (params.temperature != null) {
+            body.temperature = Math.min(Math.max(params.temperature, 0), 1.0);
+        }
+        // top_p: temperature 없을 때만
+        if (params.temperature == null && params.top_p != null) {
+            body.top_p = Math.min(Math.max(params.top_p, 0), 1.0);
+        }
     }
     if (params.stream != null) body.stream = params.stream;
 
@@ -297,7 +345,7 @@ const Interceptor = {
             DebugLog.info("tid 토큰 갱신 요청...");
             const res = await this.originalFetch.call(window, COPILOT_INTERNAL_TOKEN_URL, {
                 method: "GET",
-                headers: { "Accept": "application/json", "Authorization": `Bearer ${apiKey}` },
+                headers: { "Accept": "application/json", "Authorization": `Bearer ${apiKey}`, "Origin": "vscode-file://vscode-app" },
             });
             if (!res.ok) { DebugLog.error("tid 갱신 실패:", res.status); return ""; }
             const data = await res.json();
@@ -313,8 +361,8 @@ const Interceptor = {
 
     buildVscodeHeaders() {
         const s = getSettings();
-        const chatVer = s.chatVersion || "0.26.4";
-        const codeVer = s.codeVersion || "1.100.0";
+        const chatVer = s.chatVersion || "0.38.2026020704";
+        const codeVer = s.codeVersion || "1.109.0";
         if (!this.machineId) {
             this.machineId = Array.from({ length: 64 }, () => Math.floor(Math.random() * 16).toString(16)).join("");
         }
@@ -325,7 +373,7 @@ const Interceptor = {
             "Copilot-Integration-Id": "vscode-chat",
             "Editor-Plugin-Version": `copilot-chat/${chatVer}`,
             "Editor-Version": `vscode/${codeVer}`,
-            "User-Agent": `GitHubCopilotChat/${chatVer}`,
+            "User-Agent": `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Code/${codeVer} Chrome/142.0.7444.265 Electron/39.4.1 Safari/537.36`,
             "Vscode-Machineid": this.machineId,
             "Vscode-Sessionid": this.sessionId,
             "X-Github-Api-Version": "2025-10-01",
@@ -342,13 +390,14 @@ const Interceptor = {
         if (!token) throw new Error("토큰 없음 — API key 또는 GCM 토큰 필요");
 
         const s = getSettings();
-        const isAnthropic = s.endpoint === "anthropic";
+        const isAnthropic = s.endpoint === "anthropic" || s.endpoint === "anthropic-thinking";
+        const isThinking = s.endpoint === "anthropic-thinking";
         const isPassthrough = s.endpoint === "passthrough";
         const url = isAnthropic
             ? `${COPILOT_API_BASE}/v1/messages`
             : `${COPILOT_API_BASE}/chat/completions`;
 
-        DebugLog.info(`엔드포인트: ${s.endpoint} → ${url}`);
+        DebugLog.info(`엔드포인트: ${s.endpoint}${isThinking ? " (추론)" : ""} → ${url}`);
 
         // 헤더
         const headers = { "Content-Type": "application/json" };
@@ -356,7 +405,8 @@ const Interceptor = {
         if (isAnthropic) {
             headers["Accept"] = "application/json";
         } else {
-            headers["Accept"] = "text/event-stream";
+            // VSCode Copilot은 스트리밍 여부에 따라 Accept 헤더를 다르게 보냄
+            headers["Accept"] = requestBody.stream ? "text/event-stream" : "application/json";
         }
 
         if (s.useVscodeHeaders) {
@@ -385,8 +435,6 @@ const Interceptor = {
             delete body.user_name;
             delete body.char_name;
             delete body.group_names;
-            delete body.include_reasoning;
-            delete body.reasoning_effort;
             delete body.enable_web_search;
             delete body.request_images;
             delete body.request_image_resolution;
@@ -396,7 +444,28 @@ const Interceptor = {
             delete body.custom_exclude_body;
             delete body.custom_include_headers;
             delete body.type;
+
+            // 불필요한 SillyTavern 전용 필드 제거
+            delete body.include_reasoning;
+            delete body.reasoning_effort;
+
+            // 빈 content 메시지 제거
+            if (Array.isArray(body.messages)) {
+                body.messages = body.messages.filter(m => {
+                    const c = typeof m.content === "string" ? m.content.trim() :
+                        Array.isArray(m.content) ? m.content.map(b => b.text || "").join("").trim() : "";
+                    return !!c;
+                });
+            }
+
             DebugLog.info("패스스루 모드: SillyTavern 파라미터 정리 후 전달");
+
+            // 패스스루 body 상세 디버그
+            DebugLog.info(`  [패스스루 body] 키: [${Object.keys(body).join(", ")}]`);
+            if (body.messages?.length > 0) {
+                const roles = body.messages.map((m, i) => `[${i}]${m.role}`).join(" ");
+                DebugLog.info(`  [패스스루 body] roles: ${roles}`);
+            }
 
         } else if (isAnthropic) {
             // === Anthropic 포맷 변환 ===
@@ -406,12 +475,6 @@ const Interceptor = {
             if (body.messages?.length > 0) {
                 const roles = body.messages.map((m, i) => `[${i}]${m.role}`).join(" ");
                 DebugLog.info(`변환 전 roles: ${roles}`);
-            }
-
-            // 원본 messages role 확인 (변환 전)
-            if (body.messages?.length > 0) {
-                const roleMap = body.messages.map((m, i) => `[${i}]${m.role}`).join(" ");
-                DebugLog.info(`원본 roles: ${roleMap}`);
             }
 
             // temperature + top_p 동시 전송 방지
@@ -426,10 +489,13 @@ const Interceptor = {
                 temperature: body.temperature,
                 top_p: body.top_p,
                 stream: body.stream,
+                thinking: isThinking,
+                thinkingBudget: s.thinkingBudget || 10000,
+                adaptiveThinking: !!s.adaptiveThinking,
             };
 
             body = convertToAnthropicFormat(body.messages || [], model, params);
-            DebugLog.info(`변환 완료: system ${body.system ? "있음" : "없음"}, messages ${body.messages.length}개`);
+            DebugLog.info(`변환 완료: system ${body.system ? "있음" : "없음"}, messages ${body.messages.length}개${isThinking ? ", 추론 ON" : ""}`);
 
         } else {
             // === OpenAI 포맷 보정 ===
@@ -492,12 +558,38 @@ const Interceptor = {
         // 디버그 로그
         DebugLog.request("POST", url, headers, body);
 
+        // ━━━ 요청 body 핵심 파라미터 디버그 ━━━
+        DebugLog.info(`━━━ 요청 분석 ━━━`);
+        DebugLog.info(`  모드: ${s.endpoint}`);
+        DebugLog.info(`  URL: ${url}`);
+        DebugLog.info(`  모델: ${body.model || "(없음)"}`);
+        DebugLog.info(`  thinking 필드: ${body.thinking ? JSON.stringify(body.thinking) : "❌ 없음"}`);
+        if (isPassthrough) {
+            DebugLog.info(`  패스스루 body 키: [${Object.keys(body).join(", ")}]`);
+        }
+        DebugLog.info(`  max_tokens: ${body.max_tokens}`);
+        DebugLog.info(`  temperature: ${body.temperature ?? "(없음)"}`);
+        DebugLog.info(`  stream: ${body.stream ?? false}`);
+        DebugLog.info(`  messages: ${body.messages?.length || 0}개`);
+        if (body.system) {
+            const sysLen = Array.isArray(body.system) ? body.system.map(s => s.text?.length || 0).reduce((a,b) => a+b, 0) : (typeof body.system === "string" ? body.system.length : 0);
+            DebugLog.info(`  system 길이: ${sysLen}자`);
+        }
+        const totalMsgLen = (body.messages || []).reduce((sum, m) => {
+            if (typeof m.content === "string") return sum + m.content.length;
+            if (Array.isArray(m.content)) return sum + m.content.reduce((s, b) => s + (b.text?.length || 0), 0);
+            return sum;
+        }, 0);
+        DebugLog.info(`  메시지 총 길이: ${totalMsgLen}자`);
+        DebugLog.info(`━━━━━━━━━━━━━━━`);
+
         // 프록시 요청
         const proxyUrl = `/proxy/${encodeURIComponent(url)}`;
         const credentials = s.basicAuthCompat ? "include" : "omit";
         DebugLog.info(`credentials: ${credentials}`);
 
         const startTime = Date.now();
+        DebugLog.info(`⏱️ fetch 시작...`);
         const response = await this.originalFetch.call(window, proxyUrl, {
             method: "POST",
             headers,
@@ -509,16 +601,41 @@ const Interceptor = {
         if (!response.ok) {
             const errText = await response.clone().text();
             DebugLog.response(response.status, response.statusText, errText);
-            DebugLog.error(`요청 실패 (${elapsed}ms)`);
+            DebugLog.error(`❌ 요청 실패 (${elapsed}ms)`);
+            DebugLog.error(`  status: ${response.status}`);
+            DebugLog.error(`  에러 내용: ${errText.substring(0, 500)}`);
+
+            // Anthropic 에러를 SillyTavern이 읽을 수 있는 포맷으로 변환
+            if (isAnthropic) {
+                let errMsg = `${response.status} ${response.statusText}`;
+                try {
+                    const errData = JSON.parse(errText);
+                    errMsg = errData.error?.message || errData.message || errMsg;
+                } catch {}
+                return new Response(JSON.stringify({
+                    error: { message: errMsg, type: "api_error", code: response.status },
+                }), {
+                    status: response.status,
+                    headers: { "Content-Type": "application/json" },
+                });
+            }
         } else {
             DebugLog.response(response.status, response.statusText, "(응답 수신)");
-            DebugLog.info(`요청 성공 (${elapsed}ms)`);
+            DebugLog.info(`✅ 요청 성공 (${elapsed}ms)`);
+            DebugLog.info(`  ⏱️ 네트워크 소요: ${elapsed}ms (${(elapsed/1000).toFixed(1)}초)`);
+            // 응답 헤더 전체 덤프
+            const respHeaders = {};
+            response.headers.forEach((v, k) => { respHeaders[k] = v; });
+            DebugLog.info(`  응답 헤더: ${JSON.stringify(respHeaders)}`);
         }
 
         // Anthropic 응답을 OpenAI 포맷으로 변환 (SillyTavern이 파싱할 수 있도록)
         if (isAnthropic && response.ok) {
             return this.convertAnthropicResponse(response, body.stream);
         }
+
+        // ━━━ passthrough/openai: 응답을 그대로 반환 (다른 확장 호환성 보장) ━━━
+        // 디버그 로그도 response를 건드리므로 완전히 제거
 
         return response;
     },
@@ -532,18 +649,42 @@ const Interceptor = {
             // 스트리밍: Anthropic SSE → OpenAI SSE 변환
             const reader = response.body.getReader();
             const decoder = new TextDecoder();
+            let buffer = ""; // 불완전한 라인 버퍼
+            let inThinking = false; // thinking 블록 상태 추적
+            let thinkingAccum = ""; // 추론 내용 누적
+            let textAccum = ""; // 본문 내용 누적
+            let streamStartTime = Date.now();
+            let firstChunkTime = null;
 
             const stream = new ReadableStream({
                 async pull(controller) {
                     const { done, value } = await reader.read();
                     if (done) {
+                        // ━━━ 스트리밍 완료 요약 ━━━
+                        const streamElapsed = Date.now() - streamStartTime;
+                        const ttfb = firstChunkTime ? firstChunkTime - streamStartTime : 0;
+                        DebugLog.info(`━━━ 스트리밍 완료 ━━━`);
+                        DebugLog.info(`  총 소요: ${streamElapsed}ms (${(streamElapsed/1000).toFixed(1)}초)`);
+                        DebugLog.info(`  TTFB (첫 청크): ${ttfb}ms`);
+                        DebugLog.info(`  본문: ${textAccum.length}자`);
+                        if (thinkingAccum) {
+                            DebugLog.info(`  ⚡ 추론: ${thinkingAccum.length}자`);
+                            DebugLog.add("REQ", `━━━ 추론 내용 ━━━\n${thinkingAccum}\n━━━ 추론 끝 ━━━`);
+                        } else {
+                            DebugLog.info(`  추론: ❌ 없음`);
+                        }
+                        DebugLog.info(`━━━━━━━━━━━━━━━`);
                         controller.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
                         controller.close();
                         return;
                     }
 
-                    const chunk = decoder.decode(value, { stream: true });
-                    const lines = chunk.split("\n");
+                    if (!firstChunkTime) firstChunkTime = Date.now();
+
+                    buffer += decoder.decode(value, { stream: true });
+                    const lines = buffer.split("\n");
+                    // 마지막 줄은 불완전할 수 있으므로 버퍼에 보관
+                    buffer = lines.pop() || "";
 
                     for (const line of lines) {
                         if (!line.startsWith("data: ")) continue;
@@ -553,15 +694,82 @@ const Interceptor = {
                         try {
                             const event = JSON.parse(dataStr);
 
-                            if (event.type === "content_block_delta" && event.delta?.text) {
+                            // message_start — 모델/usage 정보
+                            if (event.type === "message_start" && event.message) {
+                                DebugLog.info(`[스트림] message_start: 모델=${event.message.model || "?"}`);
+                                if (event.message.usage) {
+                                    DebugLog.info(`[스트림] input_tokens: ${event.message.usage.input_tokens || 0}`);
+                                }
+                            }
+                            // message_delta — stop_reason, output usage
+                            else if (event.type === "message_delta") {
+                                if (event.usage) {
+                                    DebugLog.info(`[스트림] output_tokens: ${event.usage.output_tokens || 0}`);
+                                }
+                                if (event.delta?.stop_reason) {
+                                    DebugLog.info(`[스트림] stop_reason: ${event.delta.stop_reason}`);
+                                }
+                            }
+
+                            // thinking 블록 시작
+                            if (event.type === "content_block_start" && event.content_block?.type === "thinking") {
+                                inThinking = true;
+                                const tag = { choices: [{ delta: { content: "<thinking>\n" }, index: 0 }] };
+                                controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(tag)}\n\n`));
+                            }
+                            // thinking delta
+                            else if (event.type === "content_block_delta" && event.delta?.type === "thinking_delta") {
+                                thinkingAccum += event.delta.thinking || "";
+                                const chunk = { choices: [{ delta: { content: event.delta.thinking }, index: 0 }] };
+                                controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(chunk)}\n\n`));
+                            }
+                            // redacted_thinking — Claude가 추론을 검열했을 때
+                            else if (event.type === "content_block_delta" && event.delta?.type === "redacted_thinking") {
+                                if (!inThinking) {
+                                    inThinking = true;
+                                    const tag = { choices: [{ delta: { content: "<thinking>\n" }, index: 0 }] };
+                                    controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(tag)}\n\n`));
+                                }
+                                const redacted = { choices: [{ delta: { content: "\n[REDACTED]\n" }, index: 0 }] };
+                                controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(redacted)}\n\n`));
+                                DebugLog.warn("[스트림] redacted_thinking 감지");
+                            }
+                            // content 블록 시작 (text) — thinking 끝
+                            else if (event.type === "content_block_start" && event.content_block?.type === "text" && inThinking) {
+                                const tag = { choices: [{ delta: { content: "\n</thinking>\n\n" }, index: 0 }] };
+                                controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(tag)}\n\n`));
+                                inThinking = false;
+                            }
+                            // text delta
+                            else if (event.type === "content_block_delta" && event.delta?.text) {
+                                textAccum += event.delta.text || "";
                                 const openAIChunk = {
                                     choices: [{ delta: { content: event.delta.text }, index: 0 }],
                                 };
                                 controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(openAIChunk)}\n\n`));
-                            } else if (event.type === "message_stop") {
+                            }
+                            // 스트림 종료
+                            else if (event.type === "message_stop") {
+                                if (inThinking) {
+                                    const tag = { choices: [{ delta: { content: "\n</thinking>\n\n" }, index: 0 }] };
+                                    controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(tag)}\n\n`));
+                                    inThinking = false;
+                                }
                                 controller.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
                             }
-                        } catch { /* skip */ }
+                            // 스트림 중 에러
+                            else if (event.type === "error") {
+                                const errMsg = event.error?.message || "Unknown error";
+                                DebugLog.error(`[스트림] 에러 이벤트: ${errMsg}`);
+                                if (inThinking) {
+                                    const tag = { choices: [{ delta: { content: "\n</thinking>\n\n" }, index: 0 }] };
+                                    controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(tag)}\n\n`));
+                                    inThinking = false;
+                                }
+                                const errChunk = { choices: [{ delta: { content: `\n[Error: ${errMsg}]\n` }, index: 0 }] };
+                                controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(errChunk)}\n\n`));
+                            }
+                        } catch { /* skip malformed JSON */ }
                     }
                 },
             });
@@ -572,17 +780,62 @@ const Interceptor = {
             });
         } else {
             // 비스트리밍: Anthropic JSON → OpenAI JSON 변환
-            const data = await response.json();
+            let data;
+            try {
+                data = await response.json();
+            } catch (e) {
+                DebugLog.error("Anthropic 응답 JSON 파싱 실패:", String(e));
+                return new Response(JSON.stringify({
+                    choices: [{ message: { role: "assistant", content: "[CPI] 응답 파싱 실패" }, index: 0, finish_reason: "stop" }],
+                }), { status: 200, headers: { "Content-Type": "application/json" } });
+            }
+
+            const thinkingText = (data.content || [])
+                .filter(b => b.type === "thinking")
+                .map(b => b.thinking)
+                .join("");
+
             const text = (data.content || [])
                 .filter(b => b.type === "text")
                 .map(b => b.text)
                 .join("");
 
+            // ━━━ 응답 상세 디버그 ━━━
+            DebugLog.info(`━━━ 응답 분석 ━━━`);
+            DebugLog.info(`  모델: ${data.model || "(없음)"}`);
+            DebugLog.info(`  stop_reason: ${data.stop_reason || "(없음)"}`);
+            const contentTypes = (data.content || []).map(b => b.type);
+            DebugLog.info(`  content 블록: [${contentTypes.join(", ")}] (${contentTypes.length}개)`);
+            if (data.usage) {
+                DebugLog.info(`  input_tokens: ${data.usage.input_tokens || 0}`);
+                DebugLog.info(`  output_tokens: ${data.usage.output_tokens || 0}`);
+                if (data.usage.cache_creation_input_tokens) {
+                    DebugLog.info(`  cache_creation: ${data.usage.cache_creation_input_tokens}`);
+                }
+                if (data.usage.cache_read_input_tokens) {
+                    DebugLog.info(`  cache_read: ${data.usage.cache_read_input_tokens}`);
+                }
+            }
+            DebugLog.info(`  본문 길이: ${text.length}자`);
+            if (thinkingText) {
+                DebugLog.info(`  ⚡ 추론 발견: ${thinkingText.length}자`);
+                DebugLog.add("REQ", `━━━ 추론 내용 ━━━\n${thinkingText}\n━━━ 추론 끝 ━━━`);
+            } else {
+                DebugLog.info(`  추론: ❌ 없음`);
+            }
+            DebugLog.info(`━━━━━━━━━━━━━━━`);
+
+            // thinking이 있으면 <thinking> 태그로 감싸서 앞에 붙임
+            let finalText = text || "[빈 응답]";
+            if (thinkingText) {
+                finalText = `<thinking>\n${thinkingText}\n</thinking>\n\n${text}`;
+            }
+
             const openAIResponse = {
                 choices: [{
-                    message: { role: "assistant", content: text },
+                    message: { role: "assistant", content: finalText },
                     index: 0,
-                    finish_reason: data.stop_reason === "end_turn" ? "stop" : data.stop_reason,
+                    finish_reason: data.stop_reason === "end_turn" ? "stop" : (data.stop_reason || "stop"),
                 }],
                 model: data.model,
                 usage: data.usage ? {
@@ -592,7 +845,7 @@ const Interceptor = {
                 } : undefined,
             };
 
-            DebugLog.info(`Anthropic→OpenAI 응답 변환: ${text.length}자`);
+            DebugLog.info(`Anthropic→OpenAI 변환 완료: 본문 ${text.length}자${thinkingText ? ` + 추론 ${thinkingText.length}자` : ""} → 최종 ${finalText.length}자`);
 
             return new Response(JSON.stringify(openAIResponse), {
                 status: 200,
@@ -670,7 +923,13 @@ function updateStatus() {
     } else if (!hasAnyToken()) {
         el.text("⚠️ 토큰 없음 — API key 입력 또는 GCM 발급 필요").css("color", "#FF9800");
     } else if (Interceptor.active) {
-        el.text(`✅ 활성 — ${s.endpoint === "anthropic" ? "Anthropic (/v1/messages)" : s.endpoint === "passthrough" ? "패스스루 (/chat/completions)" : "OpenAI (/chat/completions)"}`).css("color", "#4CAF50");
+        const labels = {
+            "anthropic": "Anthropic (/v1/messages)",
+            "anthropic-thinking": "Anthropic 추론 (/v1/messages)",
+            "openai": "OpenAI (/chat/completions)",
+            "passthrough": "패스스루 (/chat/completions)",
+        };
+        el.text(`✅ 활성 — ${labels[s.endpoint] || s.endpoint}`).css("color", "#4CAF50");
     } else {
         el.text("⚠️ 인터셉터 미설치").css("color", "#FF9800");
     }
@@ -698,9 +957,27 @@ jQuery(async () => {
         s.endpoint = $(this).val();
         saveSettings();
         DebugLog.info("엔드포인트:", s.endpoint);
-        // OpenAI 전용 옵션 표시/숨김
         $(".cpi-openai-only").toggle(s.endpoint === "openai");
+        $(".cpi-thinking-only").toggle(s.endpoint === "anthropic-thinking");
+        $(".cpi-passthrough-only").toggle(s.endpoint === "passthrough");
         updateStatus();
+    });
+
+    // adaptive thinking
+    $("#cpi_adaptive_thinking").on("change", function () {
+        const s = getSettings();
+        s.adaptiveThinking = $(this).prop("checked");
+        saveSettings();
+        $(".cpi-budget-row").toggle(!s.adaptiveThinking);
+        DebugLog.info("Adaptive Thinking:", s.adaptiveThinking ? "ON" : "OFF");
+    });
+
+    // thinking budget
+    $("#cpi_thinking_budget").on("change", function () {
+        const s = getSettings();
+        s.thinkingBudget = parseInt($(this).val()) || 10000;
+        saveSettings();
+        DebugLog.info("추론 budget:", s.thinkingBudget);
     });
 
     $("#cpi_use_vscode_headers").on("change", function () {
@@ -727,19 +1004,104 @@ jQuery(async () => {
         s.debugLog ? $("#cpi_log_panel").slideDown(150) && DebugLog.render() : $("#cpi_log_panel").slideUp(150);
     });
     $("#cpi_chat_version").on("change", function () {
-        const s = getSettings(); s.chatVersion = $(this).val().trim() || "0.26.4"; saveSettings(); Interceptor.reset();
+        const s = getSettings(); s.chatVersion = $(this).val().trim() || "0.38.2026020704"; saveSettings(); Interceptor.reset();
     });
     $("#cpi_code_version").on("change", function () {
-        const s = getSettings(); s.codeVersion = $(this).val().trim() || "1.100.0"; saveSettings(); Interceptor.reset();
+        const s = getSettings(); s.codeVersion = $(this).val().trim() || "1.109.0"; saveSettings(); Interceptor.reset();
     });
     $("#cpi_reset_session").on("click", () => { Interceptor.reset(); toastr.info("[CPI] 세션 초기화"); updateStatus(); });
     $("#cpi_clear_log").on("click", () => { DebugLog.clear(); toastr.info("[CPI] 로그 초기화"); });
-    $("#cpi_token").on("change", function () {
+
+    // 접기/펼치기 이벤트 위임
+    $("#cpi_log_content").on("click", ".cpi-fold-btn", function () {
+        const fold = $(this).closest(".cpi-fold");
+        const action = $(this).data("action");
+        if (action === "expand") {
+            fold.find(".cpi-fold-short").hide();
+            fold.find(".cpi-fold-long").show();
+        } else {
+            fold.find(".cpi-fold-long").hide();
+            fold.find(".cpi-fold-short").show();
+        }
+    });
+
+    // 맨 아래로 스크롤
+    $("#cpi_scroll_bottom").on("click", () => {
+        const el = $("#cpi_log_content");
+        el.scrollTop(el[0]?.scrollHeight || 0);
+    });
+
+    // 모두 접기
+    $("#cpi_fold_all").on("click", function () {
+        const el = $("#cpi_log_content");
+        const isAllFolded = el.find(".cpi-fold-long:visible").length === 0;
+        if (isAllFolded) {
+            // 모두 펼치기
+            el.find(".cpi-fold-short").hide();
+            el.find(".cpi-fold-long").show();
+            $(this).val("📁 모두 접기");
+        } else {
+            // 모두 접기
+            el.find(".cpi-fold-long").hide();
+            el.find(".cpi-fold-short").show();
+            $(this).val("📂 모두 펼치기");
+        }
+    });
+
+    // 토큰 보관 시스템
+    function renderTokenSelect() {
         const s = getSettings();
-        s.token = $(this).val().trim();
+        const sel = $("#cpi_token_select");
+        sel.empty();
+        sel.append(`<option value="">-- 토큰 선택 (비어있으면 GCM 폴백) --</option>`);
+        (s.tokens || []).forEach((t, i) => {
+            const masked = t.value.substring(0, 8) + "...";
+            sel.append(`<option value="${i}" ${s.token === t.value ? "selected" : ""}>${t.name} (${masked})</option>`);
+        });
+    }
+
+    $("#cpi_token_select").on("change", function () {
+        const s = getSettings();
+        const idx = $(this).val();
+        if (idx === "" || idx === null) {
+            s.token = "";
+        } else {
+            s.token = s.tokens[parseInt(idx)]?.value || "";
+        }
         saveSettings();
         updateStatus();
-        DebugLog.info(`토큰 ${s.token ? "설정됨" : "제거됨 (GCM 폴백)"}`);
+        DebugLog.info(s.token ? `토큰 선택: ${s.token.substring(0, 10)}...` : "토큰 해제 (GCM 폴백)");
+    });
+
+    $("#cpi_token_add").on("click", function () {
+        const s = getSettings();
+        const name = $("#cpi_token_name").val().trim();
+        const value = $("#cpi_token_value").val().trim();
+        if (!value) { toastr.warning("[CPI] 토큰을 입력하세요"); return; }
+        if (!s.tokens) s.tokens = [];
+        s.tokens.push({ name: name || `토큰 ${s.tokens.length + 1}`, value });
+        s.token = value;
+        saveSettings();
+        renderTokenSelect();
+        updateStatus();
+        $("#cpi_token_name").val("");
+        $("#cpi_token_value").val("");
+        toastr.success(`[CPI] 토큰 추가: ${name || "토큰"}`);
+        DebugLog.info(`토큰 추가: ${name} (${value.substring(0, 10)}...)`);
+    });
+
+    $("#cpi_token_delete").on("click", function () {
+        const s = getSettings();
+        const idx = $("#cpi_token_select").val();
+        if (idx === "" || idx === null) { toastr.warning("[CPI] 삭제할 토큰을 선택하세요"); return; }
+        const i = parseInt(idx);
+        const removed = s.tokens.splice(i, 1)[0];
+        if (s.token === removed.value) s.token = "";
+        saveSettings();
+        renderTokenSelect();
+        updateStatus();
+        toastr.info(`[CPI] 토큰 삭제: ${removed.name}`);
+        DebugLog.info(`토큰 삭제: ${removed.name}`);
     });
 
     // 설정 로드
@@ -750,7 +1112,11 @@ jQuery(async () => {
 
     $("#cpi_enabled").prop("checked", s.enabled);
     $("#cpi_endpoint").val(s.endpoint);
-    $("#cpi_token").val(s.token || "");
+    renderTokenSelect();
+    $("#cpi_thinking_budget").val(s.thinkingBudget || 10000);
+    $("#cpi_adaptive_thinking").prop("checked", !!s.adaptiveThinking);
+    $(".cpi-budget-row").toggle(!s.adaptiveThinking);
+
     $("#cpi_use_vscode_headers").prop("checked", s.useVscodeHeaders);
     $("#cpi_remove_prefill").prop("checked", s.removePrefill);
     $("#cpi_trim_assistant").prop("checked", s.trimAssistant);
@@ -761,6 +1127,8 @@ jQuery(async () => {
     $("#cpi_code_version").val(s.codeVersion);
 
     $(".cpi-openai-only").toggle(s.endpoint === "openai");
+    $(".cpi-thinking-only").toggle(s.endpoint === "anthropic-thinking");
+    $(".cpi-passthrough-only").toggle(s.endpoint === "passthrough");
     if (!s.debugLog) $("#cpi_log_panel").hide();
 
     if (s.enabled) Interceptor.install();
