@@ -27,7 +27,7 @@ const defaultSettings = {
     codeVersion: "1.109.0",
 };
 
-const LOG_MAX = 500;
+const LOG_MAX = 200;
 
 // ============================================================
 // 디버그 로그
@@ -35,8 +35,18 @@ const LOG_MAX = 500;
 const DebugLog = {
     entries: [],
 
+    _renderTimer: null,
+
     add(level, ...args) {
         const s = getSettings();
+
+        // 디버그 꺼져있으면 ERROR/WARN만 콘솔에 출력하고 끝
+        if (!s.debugLog) {
+            if (level === "ERROR") console.error(`[CPI] ${args.join(" ")}`);
+            else if (level === "WARN") console.warn(`[CPI] ${args.join(" ")}`);
+            return;
+        }
+
         const time = new Date().toLocaleTimeString("ko-KR", { hour12: false });
         const msg = args.map(a =>
             typeof a === "object" ? JSON.stringify(a, null, 2) : String(a)
@@ -49,7 +59,13 @@ const DebugLog = {
         else if (level === "WARN") console.warn(`[CPI] ${msg}`);
         else console.log(`[CPI] ${msg}`);
 
-        if (s.debugLog) this.render();
+        // 디바운스 렌더링 (200ms 내 중복 호출 방지)
+        if (!this._renderTimer) {
+            this._renderTimer = setTimeout(() => {
+                this._renderTimer = null;
+                this.render();
+            }, 200);
+        }
     },
 
     info(...a) { this.add("INFO", ...a); },
@@ -98,36 +114,49 @@ const DebugLog = {
         }
     },
 
+    _lastRenderedCount: 0,
+
+    _buildEntry(e, idx) {
+        const colors = { INFO: "#8bc34a", WARN: "#FF9800", ERROR: "#f44336", REQ: "#64b5f6", RES: "#ce93d8" };
+        const FOLD_THRESHOLD = 200;
+        const c = colors[e.level] || "#ccc";
+        const escaped = escapeHtmlBr(e.msg);
+        const header = `<span style="color:#666;">[${e.time}]</span> <span style="color:${c};font-weight:bold;">[${e.level}]</span> `;
+        if (e.msg.length > FOLD_THRESHOLD) {
+            const preview = escapeHtmlBr(e.msg.substring(0, FOLD_THRESHOLD));
+            return `<div style="margin:1px 0;">${header}<span class="cpi-fold" data-idx="${idx}"><span class="cpi-fold-short" style="color:#ddd;">${preview}<span class="cpi-fold-btn" data-action="expand" style="color:#64b5f6;cursor:pointer;margin-left:4px;">▼ 펼치기</span></span><span class="cpi-fold-long" style="display:none;color:#ddd;">${escaped}<br><span class="cpi-fold-btn" data-action="collapse" style="color:#64b5f6;cursor:pointer;">▲ 접기</span></span></span></div>`;
+        }
+        return `<div style="margin:1px 0;">${header}<span style="color:#ddd;">${escaped}</span></div>`;
+    },
+
     render() {
         const el = $("#cpi_log_content");
         if (!el.length) return;
-        const colors = { INFO: "#8bc34a", WARN: "#FF9800", ERROR: "#f44336", REQ: "#64b5f6", RES: "#ce93d8" };
-        const FOLD_THRESHOLD = 200;
-        const html = this.entries.map((e, idx) => {
-            const c = colors[e.level] || "#ccc";
-            const escaped = escapeHtml(e.msg);
-            const needsFold = escaped.length > FOLD_THRESHOLD;
-            const header = `<span style="color:#666;">[${e.time}]</span> <span style="color:${c};font-weight:bold;">[${e.level}]</span> `;
-            if (needsFold) {
-                const preview = escaped.substring(0, FOLD_THRESHOLD).replace(/\n/g, "<br>");
-                const full = escaped.replace(/\n/g, "<br>");
-                return `<div style="margin:1px 0;">${header}<span class="cpi-fold" data-idx="${idx}"><span class="cpi-fold-short" style="color:#ddd;">${preview}<span class="cpi-fold-btn" data-action="expand" style="color:#64b5f6;cursor:pointer;margin-left:4px;">▼ 펼치기</span></span><span class="cpi-fold-long" style="display:none;color:#ddd;">${full}<br><span class="cpi-fold-btn" data-action="collapse" style="color:#64b5f6;cursor:pointer;">▲ 접기</span></span></span></div>`;
-            }
-            const f = escaped.replace(/\n/g, "<br>");
-            return `<div style="margin:1px 0;">${header}<span style="color:#ddd;">${f}</span></div>`;
-        }).join("");
-        el.html(html);
-        // 자동 스크롤 (맨 아래로)
+
+        // LOG_MAX으로 shift 됐거나 clear 됐으면 전체 다시 그림
+        if (this.entries.length < this._lastRenderedCount) {
+            el.html(this.entries.map((e, i) => this._buildEntry(e, i)).join(""));
+            this._lastRenderedCount = this.entries.length;
+        } else if (this.entries.length > this._lastRenderedCount) {
+            // 새로 추가된 것만 append
+            const newHtml = this.entries
+                .slice(this._lastRenderedCount)
+                .map((e, i) => this._buildEntry(e, this._lastRenderedCount + i))
+                .join("");
+            el[0].insertAdjacentHTML("beforeend", newHtml);
+            this._lastRenderedCount = this.entries.length;
+        }
+
         requestAnimationFrame(() => {
             el.scrollTop(el[0]?.scrollHeight || 0);
         });
     },
 
-    clear() { this.entries = []; this.render(); },
+    clear() { this.entries = []; this._lastRenderedCount = 0; $("#cpi_log_content").html(""); },
 };
 
-function escapeHtml(s) {
-    return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+function escapeHtmlBr(s) {
+    return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\n/g, "<br>");
 }
 
 // ============================================================
@@ -595,6 +624,7 @@ const Interceptor = {
             headers,
             body: JSON.stringify(body),
             credentials,
+            // signal은 ST 프록시 호환성 문제로 전달하지 않음
         });
         const elapsed = Date.now() - startTime;
 
@@ -631,7 +661,14 @@ const Interceptor = {
 
         // Anthropic 응답을 OpenAI 포맷으로 변환 (SillyTavern이 파싱할 수 있도록)
         if (isAnthropic && response.ok) {
-            return this.convertAnthropicResponse(response, body.stream);
+            try {
+                return await this.convertAnthropicResponse(response, body.stream);
+            } catch (e) {
+                DebugLog.error("Anthropic 응답 변환 실패:", String(e));
+                return new Response(JSON.stringify({
+                    choices: [{ message: { role: "assistant", content: `[CPI] 응답 변환 오류: ${e.message}` }, index: 0, finish_reason: "stop" }],
+                }), { status: 200, headers: { "Content-Type": "application/json" } });
+            }
         }
 
         // ━━━ passthrough/openai: 응답을 그대로 반환 (다른 확장 호환성 보장) ━━━
@@ -658,6 +695,7 @@ const Interceptor = {
 
             const stream = new ReadableStream({
                 async pull(controller) {
+                    try {
                     const { done, value } = await reader.read();
                     if (done) {
                         // ━━━ 스트리밍 완료 요약 ━━━
@@ -770,6 +808,13 @@ const Interceptor = {
                                 controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(errChunk)}\n\n`));
                             }
                         } catch { /* skip malformed JSON */ }
+                    }
+                    } catch (e) {
+                        DebugLog.error("스트림 읽기 실패:", String(e));
+                        try {
+                            controller.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
+                            controller.close();
+                        } catch { /* already closed */ }
                     }
                 },
             });
@@ -887,7 +932,13 @@ const Interceptor = {
             } catch (error) {
                 DebugLog.error("인터셉트 실패:", String(error));
                 toastr.error(`[CPI] ${error.message}`);
-                return self.originalFetch.apply(window, args);
+                try {
+                    return await self.originalFetch.apply(window, args);
+                } catch {
+                    return new Response(JSON.stringify({ error: { message: error.message } }), {
+                        status: 500, headers: { "Content-Type": "application/json" }
+                    });
+                }
             }
         };
 
