@@ -38,6 +38,7 @@
                     <option value="anthropic">Anthropic (/v1/messages) — 클로드 권장</option>
                     <option value="anthropic-thinking">Anthropic 추론 (/v1/messages) — 확장 추론</option>
                     <option value="openai">OpenAI (/chat/completions) — 클로드 호환</option>
+                                                            <option value="responses">Responses (/responses) — ST 호환 어댑터</option>
                     <option value="passthrough">패스스루 (/chat/completions) — 변환 없이 그대로 (제미니 등)</option>
                 </select>
                 <small class="cpi-dim">Anthropic: system role 완벽 지원, 클로드 네이티브 포맷<br>Anthropic 추론: 확장 추론 활성화 (temperature 무시)<br>OpenAI: 호환성 높지만 system 처리가 다를 수 있음<br>패스스루: 인증/헤더만 처리, body 변환 없음</small>
@@ -86,7 +87,7 @@
 
             <!-- OpenAI 전용 보정 옵션 -->
             <div class="cpi-section cpi-openai-only">
-                <h4><i class="fa-solid fa-wrench"></i> OpenAI 포맷 보정 (OpenAI 모드 전용)</h4>
+                                <h4><i class="fa-solid fa-wrench"></i> OpenAI 전용 보정 옵션 (OpenAI/Responses 전용)</h4>
 
                 <label class="checkbox_label cpi-toggle">
                     <input id="cpi_remove_prefill" type="checkbox" checked />

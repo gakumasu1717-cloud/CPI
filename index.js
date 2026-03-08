@@ -1,4 +1,4 @@
-// CPI - Copilot Interceptor
+﻿// CPI - Copilot Interceptor
 // OpenAI (/chat/completions) 또는 Anthropic (/v1/messages) 엔드포인트 선택 가능
 import { extension_settings } from "../../../extensions.js";
 import { saveSettingsDebounced } from "../../../../script.js";
@@ -17,7 +17,7 @@ const defaultSettings = {
     forceLastUser: true,
     basicAuthCompat: false,
     debugLog: true,
-    endpoint: "anthropic",  // "openai", "anthropic", "anthropic-thinking", "passthrough"
+    endpoint: "anthropic",  // "openai", "anthropic", "anthropic-thinking", "passthrough", "responses"
     thinkingBudget: 10000,  // thinking budget_tokens
     adaptiveThinking: false, // adaptive thinking (Opus 4.6+, Copilot 미지원 가능)
 
@@ -72,6 +72,7 @@ const DebugLog = {
     warn(...a) { this.add("WARN", ...a); },
     error(...a) { this.add("ERROR", ...a); },
 
+
     request(method, url, headers, body) {
         this.add("REQ", `━━━ 요청 ━━━`);
         this.add("REQ", `${method} ${url}`);
@@ -100,9 +101,26 @@ const DebugLog = {
             this.add("REQ", `━━━ System (${sysText.length}자) ━━━\n${sysText}`);
         }
 
+        // instructions / input (Responses 포맷)
+        if (body?.instructions) {
+            const instructionsText = typeof body.instructions === "string" ? body.instructions : JSON.stringify(body.instructions);
+            this.add("REQ", `━━━ Instructions (${instructionsText.length}자) ━━━\n${instructionsText}`);
+        }
+
+        const inputItems = Array.isArray(body?.input) ? body.input : [];
+        if (inputItems.length > 0) {
+            this.add("REQ", `━━━ Input (${inputItems.length}개) ━━━`);
+            inputItems.forEach((item, i) => {
+                const c = extractTextFromMessageContent(item?.content, `request.input[${i}]`);
+                this.add("REQ", `[${i}] role=${item?.role || "?"} (${c.length}자)\n${c}`);
+            });
+            this.add("REQ", `━━━ Input 끝 ━━━`);
+        }
         const params = { ...body };
         delete params.messages;
         delete params.system;
+        delete params.instructions;
+        delete params.input;
         this.add("REQ", `기타: ${JSON.stringify(params)}`);
     },
 
@@ -229,7 +247,6 @@ function saveSettings() { saveSettingsDebounced(); }
 // ============================================================
 // OpenAI → Anthropic 포맷 변환
 // ============================================================
-// ============================================================
 function convertToAnthropicFormat(messages, model, params) {
     const openAIChats = structuredClone(messages);
 
@@ -354,6 +371,300 @@ function convertToAnthropicFormat(messages, model, params) {
 }
 
 // ============================================================
+// Responses 어댑터 유틸
+// ST(OpenAI-style) 요청/응답을 Responses 포맷으로 변환
+// ============================================================
+function buildTargetUrl(endpoint) {
+    if (endpoint === "anthropic" || endpoint === "anthropic-thinking") {
+        return `${COPILOT_API_BASE}/v1/messages`;
+    }
+    if (endpoint === "responses") {
+        return `${COPILOT_API_BASE}/responses`;
+    }
+    return `${COPILOT_API_BASE}/chat/completions`;
+}
+
+function previewText(text, max = 160) {
+    if (!text) return "";
+    const compact = String(text).replace(/\s+/g, " ").trim();
+    return compact.length > max ? `${compact.substring(0, max)}...` : compact;
+}
+
+function extractTextFromMessageContent(content, context = "message") {
+    if (typeof content === "string") return content;
+
+    if (Array.isArray(content)) {
+        let text = "";
+        content.forEach((part, index) => {
+            if (typeof part === "string") {
+                text += part;
+                return;
+            }
+            if (!part || typeof part !== "object") {
+                DebugLog.warn(`${context}[${index}] 알 수 없는 content part`);
+                return;
+            }
+            if (typeof part.text === "string") {
+                text += part.text;
+                return;
+            }
+            if (typeof part.content === "string") {
+                text += part.content;
+                return;
+            }
+            DebugLog.warn(`${context}[${index}] 미지원 part type: ${part.type || "unknown"}`);
+        });
+        return text;
+    }
+
+    if (content && typeof content === "object") {
+        if (typeof content.text === "string") return content.text;
+        if (typeof content.content === "string") return content.content;
+        DebugLog.warn(`${context} 알 수 없는 object content`);
+    }
+
+    return "";
+}
+
+function buildResponsesReasoningConfig(requestBody) {
+    const existing = requestBody?.reasoning && typeof requestBody.reasoning === "object"
+        ? requestBody.reasoning
+        : {};
+    const reasoning = {};
+
+    const effort = existing.effort ?? requestBody?.reasoning_effort;
+    if (effort != null) {
+        reasoning.effort = effort;
+    }
+
+    const summary = existing.summary ?? (requestBody?.include_reasoning ? "auto" : undefined);
+    if (summary != null && summary !== false) {
+        reasoning.summary = summary;
+    }
+
+    return Object.keys(reasoning).length > 0 ? reasoning : null;
+}
+
+function convertToResponsesFormat(requestBody) {
+    const messages = Array.isArray(requestBody?.messages) ? requestBody.messages : [];
+    const instructions = [];
+    const input = [];
+
+    messages.forEach((message, index) => {
+        if (!message || typeof message !== "object") {
+            DebugLog.warn(`responses.messages[${index}] 잘못된 message 형식`);
+            return;
+        }
+
+        const role = message.role || "user";
+        const content = extractTextFromMessageContent(message.content, `responses.messages[${index}]`);
+        if (!content.trim()) {
+            return;
+        }
+
+        if (role === "system" || role === "developer") {
+            instructions.push(content.trim());
+            return;
+        }
+
+        if (role !== "user" && role !== "assistant") {
+            DebugLog.warn(`responses.messages[${index}] 미지원 role: ${role}`);
+            return;
+        }
+
+        // 연속 같은 role 병합 (Anthropic 변환과 동일한 패턴)
+        const last = input.length > 0 ? input[input.length - 1] : null;
+        if (last && last.role === role) {
+            last.content += "\n\n" + content;
+        } else {
+            input.push({ role, content });
+        }
+    });
+
+    if (input.length === 0) {
+        input.push({ role: "user", content: "Continue" });
+    } else if (input[input.length - 1].role !== "user") {
+        input.push({ role: "user", content: "Continue" });
+    }
+
+    const body = {
+        model: requestBody?.model || "gpt-4.1",
+        input,
+    };
+
+    if (instructions.length > 0) {
+        body.instructions = instructions.join("\n\n");
+    }
+    if (requestBody?.stream != null) body.stream = requestBody.stream;
+    if (requestBody?.temperature != null) body.temperature = requestBody.temperature;
+    if (requestBody?.top_p != null) body.top_p = requestBody.top_p;
+
+    if (requestBody?.max_tokens != null) {
+        body.max_output_tokens = requestBody.max_tokens;
+    } else if (requestBody?.max_output_tokens != null) {
+        body.max_output_tokens = requestBody.max_output_tokens;
+    }
+
+    const reasoning = buildResponsesReasoningConfig(requestBody);
+    if (reasoning) {
+        body.reasoning = reasoning;
+    }
+
+    if (requestBody?.store != null) body.store = requestBody.store;
+    if (requestBody?.metadata != null) body.metadata = requestBody.metadata;
+    if (requestBody?.user != null) body.user = requestBody.user;
+    if (requestBody?.text != null) body.text = requestBody.text;
+    if (requestBody?.stream_options != null) body.stream_options = requestBody.stream_options;
+
+    if (requestBody?.response_format != null) {
+        DebugLog.warn("Responses 변환: response_format은 직접 매핑되지 않아 무시됨");
+    }
+    if (requestBody?.tools != null || requestBody?.tool_choice != null) {
+        DebugLog.warn("Responses 변환: tool 관련 필드는 직접 매핑되지 않아 무시됨");
+    }
+
+    return body;
+}
+
+function extractResponsesTextFromPart(part) {
+    if (!part || typeof part !== "object") return "";
+    if ((part.type === "output_text" || part.type === "text" || part.type === "summary_text" || part.type === "reasoning_text") && typeof part.text === "string") {
+        return part.text;
+    }
+    if (part.type === "refusal" && typeof part.refusal === "string") {
+        return part.refusal;
+    }
+    return "";
+}
+
+function extractResponsesReasoningTextFromItem(item) {
+    if (!item || typeof item !== "object") return "";
+
+    if (Array.isArray(item.summary) && item.summary.length > 0) {
+        return item.summary.map(extractResponsesTextFromPart).join("");
+    }
+
+    if (Array.isArray(item.content) && item.content.length > 0) {
+        return item.content.map(extractResponsesTextFromPart).join("");
+    }
+
+    return "";
+}
+
+function extractResponsesOutputText(apiResponse) {
+    if (typeof apiResponse?.output_text === "string") {
+        return apiResponse.output_text;
+    }
+
+    if (Array.isArray(apiResponse?.output_text)) {
+        return apiResponse.output_text.map(extractResponsesTextFromPart).join("");
+    }
+
+    const output = Array.isArray(apiResponse?.output) ? apiResponse.output : [];
+    const segments = [];
+
+    output.forEach((item) => {
+        if (!item || typeof item !== "object") return;
+
+        if (item.type === "message" && item.role === "assistant") {
+            segments.push((Array.isArray(item.content) ? item.content : []).map(extractResponsesTextFromPart).join(""));
+            return;
+        }
+
+        if (item.type === "output_text") {
+            segments.push(extractResponsesTextFromPart(item));
+        }
+    });
+
+    return segments.join("");
+}
+
+function extractResponsesReasoningText(apiResponse) {
+    const output = Array.isArray(apiResponse?.output) ? apiResponse.output : [];
+    const segments = [];
+
+    output.forEach((item) => {
+        if (!item || typeof item !== "object") return;
+        if (item.type === "reasoning") {
+            const text = extractResponsesReasoningTextFromItem(item);
+            if (text) segments.push(text);
+        }
+    });
+
+    return segments.join("\n\n");
+}
+
+function formatThinkingContent(reasoningText, responseText) {
+    const finalText = responseText || "";
+    if (!reasoningText) return finalText;
+    return finalText
+        ? `<thinking>\n${reasoningText}\n</thinking>\n\n${finalText}`
+        : `<thinking>\n${reasoningText}\n</thinking>`;
+}
+
+function mapResponsesFinishReason(apiResponse) {
+    const reason = apiResponse?.incomplete_details?.reason || apiResponse?.reason;
+    if (reason === "max_output_tokens" || reason === "max_tokens") {
+        return "length";
+    }
+    return "stop";
+}
+
+function convertResponsesToOpenAIResponse(apiResponse, options = {}) {
+    const responseText = extractResponsesOutputText(apiResponse);
+    const reasoningText = extractResponsesReasoningText(apiResponse);
+
+    if (!responseText && !reasoningText) {
+        DebugLog.warn("Responses 응답에서 assistant 텍스트를 찾지 못함");
+    }
+
+    const finalText = formatThinkingContent(reasoningText, responseText);
+    const usage = apiResponse?.usage ? {
+        prompt_tokens: apiResponse.usage.input_tokens,
+        completion_tokens: apiResponse.usage.output_tokens,
+        total_tokens: apiResponse.usage.total_tokens
+            ?? ((apiResponse.usage.input_tokens || 0) + (apiResponse.usage.output_tokens || 0)),
+    } : undefined;
+
+    return {
+        id: apiResponse?.id || options.id || `resp-${Date.now()}`,
+        object: "chat.completion",
+        created: apiResponse?.created_at || options.created || Math.floor(Date.now() / 1000),
+        model: apiResponse?.model || options.model,
+        choices: [{
+            index: 0,
+            message: {
+                role: "assistant",
+                content: finalText,
+            },
+            finish_reason: mapResponsesFinishReason(apiResponse),
+        }],
+        usage,
+    };
+}
+
+function normalizeResponsesError(error, responseText, status) {
+    let message = error?.message || `${status || 500} Responses 응답 오류`;
+
+    if (responseText) {
+        try {
+            const parsed = JSON.parse(responseText);
+            message = parsed.error?.message || parsed.message || message;
+        } catch {
+            message = responseText;
+        }
+    }
+
+    return {
+        error: {
+            message: `Responses API 요청 실패: ${message}`,
+            type: "responses_error",
+            code: status,
+        },
+    };
+}
+
+// ============================================================
 // Copilot 인터셉터
 // ============================================================
 const Interceptor = {
@@ -421,20 +732,16 @@ const Interceptor = {
         const s = getSettings();
         const isAnthropic = s.endpoint === "anthropic" || s.endpoint === "anthropic-thinking";
         const isThinking = s.endpoint === "anthropic-thinking";
+        const isResponses = s.endpoint === "responses";
         const isPassthrough = s.endpoint === "passthrough";
-        const url = isAnthropic
-            ? `${COPILOT_API_BASE}/v1/messages`
-            : `${COPILOT_API_BASE}/chat/completions`;
+        const url = buildTargetUrl(s.endpoint);
 
         DebugLog.info(`엔드포인트: ${s.endpoint}${isThinking ? " (추론)" : ""} → ${url}`);
 
-        // 헤더
         const headers = { "Content-Type": "application/json" };
-
         if (isAnthropic) {
             headers["Accept"] = "application/json";
         } else {
-            // VSCode Copilot은 스트리밍 여부에 따라 Accept 헤더를 다르게 보냄
             headers["Accept"] = requestBody.stream ? "text/event-stream" : "application/json";
         }
 
@@ -480,9 +787,10 @@ const Interceptor = {
 
             // 빈 content 메시지 제거
             if (Array.isArray(body.messages)) {
-                body.messages = body.messages.filter(m => {
-                    const c = typeof m.content === "string" ? m.content.trim() :
-                        Array.isArray(m.content) ? m.content.map(b => b.text || "").join("").trim() : "";
+                body.messages = body.messages.filter((m) => {
+                    const c = typeof m.content === "string" ? m.content.trim()
+                        : Array.isArray(m.content) ? m.content.map(b => b.text || "").join("").trim()
+                        : "";
                     return !!c;
                 });
             }
@@ -495,7 +803,6 @@ const Interceptor = {
                 const roles = body.messages.map((m, i) => `[${i}]${m.role}`).join(" ");
                 DebugLog.info(`  [패스스루 body] roles: ${roles}`);
             }
-
         } else if (isAnthropic) {
             // === Anthropic 포맷 변환 ===
             DebugLog.info("OpenAI → Anthropic 포맷 변환 중...");
@@ -508,7 +815,7 @@ const Interceptor = {
 
             // temperature + top_p 동시 전송 방지
             if (body.temperature != null && body.top_p != null) {
-                DebugLog.warn(`top_p 제거 (temperature와 동시 사용 불가)`);
+                DebugLog.warn("top_p 제거 (temperature와 동시 사용 불가)");
                 delete body.top_p;
             }
 
@@ -525,62 +832,67 @@ const Interceptor = {
 
             body = convertToAnthropicFormat(body.messages || [], model, params);
             DebugLog.info(`변환 완료: system ${body.system ? "있음" : "없음"}, messages ${body.messages.length}개${isThinking ? ", 추론 ON" : ""}`);
-
         } else {
-            // === OpenAI 포맷 보정 ===
-
-            // temperature + top_p 동시 전송 방지
+            // Responses도 ST의 OpenAI-style 입력을 받은 뒤 2차 어댑터 변환이 필요
             if (body.temperature != null && body.top_p != null) {
-                DebugLog.warn(`top_p 제거 (temperature와 동시 사용 불가)`);
+                DebugLog.warn("top_p 제거 (temperature와 동시 사용 불가)");
                 delete body.top_p;
             }
 
-            // SillyTavern 전용 파라미터 정리
             delete body.chat_completion_source;
             delete body.user_name;
             delete body.char_name;
             delete body.group_names;
-            delete body.include_reasoning;
-            delete body.reasoning_effort;
             delete body.enable_web_search;
             delete body.request_images;
+            delete body.request_image_resolution;
+            delete body.request_image_aspect_ratio;
             delete body.custom_prompt_post_processing;
             delete body.custom_include_body;
             delete body.custom_exclude_body;
             delete body.custom_include_headers;
             delete body.type;
 
-            // 프리필 제거
+            if (!isResponses) {
+                delete body.include_reasoning;
+                delete body.reasoning_effort;
+                delete body.reasoning;
+            }
+
             if (s.removePrefill && body.messages?.length > 0) {
                 let removed = 0;
                 while (body.messages.length > 1 && body.messages[body.messages.length - 1].role === "assistant") {
-                    const r = body.messages.pop();
-                    DebugLog.warn(`프리필 제거: [${r.role}]`);
+                    const removedMessage = body.messages.pop();
+                    DebugLog.warn(`프리필 제거: [${removedMessage.role}]`);
                     removed++;
                 }
                 if (removed > 0) DebugLog.info(`${removed}개 프리필 제거됨`);
             }
 
-            // assistant trailing whitespace trim
             if (s.trimAssistant && body.messages?.length > 0) {
-                for (const m of body.messages) {
-                    if (m.role === "assistant" && typeof m.content === "string") {
-                        const orig = m.content;
-                        m.content = m.content.trimEnd();
-                        if (orig !== m.content) {
-                            DebugLog.warn(`assistant 끝 공백 제거 (${orig.length} → ${m.content.length}자)`);
+                for (const message of body.messages) {
+                    if (message.role === "assistant" && typeof message.content === "string") {
+                        const original = message.content;
+                        message.content = message.content.trimEnd();
+                        if (original !== message.content) {
+                            DebugLog.warn(`assistant 끝 공백 제거 (${original.length} → ${message.content.length}자)`);
                         }
                     }
                 }
             }
 
-            // 마지막 메시지 user 강제
             if (s.forceLastUser && body.messages?.length > 0) {
                 const last = body.messages[body.messages.length - 1];
                 if (last.role !== "user") {
                     DebugLog.warn(`마지막 role 변환: ${last.role} → user`);
                     last.role = "user";
                 }
+            }
+
+            if (isResponses) {
+                DebugLog.info("OpenAI → Responses 포맷 변환 중...");
+                body = convertToResponsesFormat(body);
+                DebugLog.info(`변환 완료: instructions ${body.instructions ? "있음" : "없음"}, input ${body.input.length}개${body.reasoning ? ", reasoning ON" : ""}`);
             }
         }
 
@@ -592,27 +904,46 @@ const Interceptor = {
         DebugLog.info(`  모드: ${s.endpoint}`);
         DebugLog.info(`  URL: ${url}`);
         DebugLog.info(`  모델: ${body.model || "(없음)"}`);
-        DebugLog.info(`  thinking 필드: ${body.thinking ? JSON.stringify(body.thinking) : "❌ 없음"}`);
+        DebugLog.info(`  stream: ${body.stream ?? false}`);
+        DebugLog.info(`  temperature: ${body.temperature ?? "(없음)"}`);
+
         if (isPassthrough) {
             DebugLog.info(`  패스스루 body 키: [${Object.keys(body).join(", ")}]`);
+        } else if (isResponses) {
+            const instructionsText = typeof body.instructions === "string" ? body.instructions : "";
+            const totalInputLen = Array.isArray(body.input)
+                ? body.input.reduce((sum, item) => sum + extractTextFromMessageContent(item?.content).length, 0)
+                : 0;
+            const inputPreview = Array.isArray(body.input)
+                ? previewText(body.input.map((item) => `[${item.role}] ${extractTextFromMessageContent(item?.content)}`).join("\n"))
+                : "";
+
+            DebugLog.info(`  instructions 길이: ${instructionsText.length}자`);
+            DebugLog.info(`  instructions preview: ${previewText(instructionsText) || "(없음)"}`);
+            DebugLog.info(`  input: ${body.input?.length || 0}개`);
+            DebugLog.info(`  input 총 길이: ${totalInputLen}자`);
+            DebugLog.info(`  input preview: ${inputPreview || "(없음)"}`);
+            DebugLog.info(`  max_output_tokens: ${body.max_output_tokens ?? "(없음)"}`);
+            DebugLog.info(`  reasoning: ${body.reasoning ? JSON.stringify(body.reasoning) : "❌ 없음"}`);
+        } else {
+            DebugLog.info(`  thinking 필드: ${body.thinking ? JSON.stringify(body.thinking) : "❌ 없음"}`);
+            DebugLog.info(`  max_tokens: ${body.max_tokens}`);
+            DebugLog.info(`  messages: ${body.messages?.length || 0}개`);
+            if (body.system) {
+                const sysLen = Array.isArray(body.system)
+                    ? body.system.map((item) => item.text?.length || 0).reduce((a, b) => a + b, 0)
+                    : (typeof body.system === "string" ? body.system.length : 0);
+                DebugLog.info(`  system 길이: ${sysLen}자`);
+            }
+            const totalMsgLen = (body.messages || []).reduce((sum, message) => {
+                if (typeof message.content === "string") return sum + message.content.length;
+                if (Array.isArray(message.content)) return sum + message.content.reduce((acc, part) => acc + (part.text?.length || 0), 0);
+                return sum;
+            }, 0);
+            DebugLog.info(`  메시지 총 길이: ${totalMsgLen}자`);
         }
-        DebugLog.info(`  max_tokens: ${body.max_tokens}`);
-        DebugLog.info(`  temperature: ${body.temperature ?? "(없음)"}`);
-        DebugLog.info(`  stream: ${body.stream ?? false}`);
-        DebugLog.info(`  messages: ${body.messages?.length || 0}개`);
-        if (body.system) {
-            const sysLen = Array.isArray(body.system) ? body.system.map(s => s.text?.length || 0).reduce((a,b) => a+b, 0) : (typeof body.system === "string" ? body.system.length : 0);
-            DebugLog.info(`  system 길이: ${sysLen}자`);
-        }
-        const totalMsgLen = (body.messages || []).reduce((sum, m) => {
-            if (typeof m.content === "string") return sum + m.content.length;
-            if (Array.isArray(m.content)) return sum + m.content.reduce((s, b) => s + (b.text?.length || 0), 0);
-            return sum;
-        }, 0);
-        DebugLog.info(`  메시지 총 길이: ${totalMsgLen}자`);
         DebugLog.info(`━━━━━━━━━━━━━━━`);
 
-        // 프록시 요청
         const proxyUrl = `/proxy/${encodeURIComponent(url)}`;
         const credentials = s.basicAuthCompat ? "include" : "omit";
         DebugLog.info(`credentials: ${credentials}`);
@@ -624,7 +955,6 @@ const Interceptor = {
             headers,
             body: JSON.stringify(body),
             credentials,
-            // signal은 ST 프록시 호환성 문제로 전달하지 않음
         });
         const elapsed = Date.now() - startTime;
 
@@ -635,7 +965,6 @@ const Interceptor = {
             DebugLog.error(`  status: ${response.status}`);
             DebugLog.error(`  에러 내용: ${errText.substring(0, 500)}`);
 
-            // Anthropic 에러를 SillyTavern이 읽을 수 있는 포맷으로 변환
             if (isAnthropic) {
                 let errMsg = `${response.status} ${response.statusText}`;
                 try {
@@ -649,17 +978,22 @@ const Interceptor = {
                     headers: { "Content-Type": "application/json" },
                 });
             }
+
+            if (isResponses) {
+                return new Response(JSON.stringify(normalizeResponsesError(new Error(response.statusText), errText, response.status)), {
+                    status: response.status,
+                    headers: { "Content-Type": "application/json" },
+                });
+            }
         } else {
             DebugLog.response(response.status, response.statusText, "(응답 수신)");
             DebugLog.info(`✅ 요청 성공 (${elapsed}ms)`);
-            DebugLog.info(`  ⏱️ 네트워크 소요: ${elapsed}ms (${(elapsed/1000).toFixed(1)}초)`);
-            // 응답 헤더 전체 덤프
+            DebugLog.info(`  ⏱️ 네트워크 소요: ${elapsed}ms (${(elapsed / 1000).toFixed(1)}초)`);
             const respHeaders = {};
             response.headers.forEach((v, k) => { respHeaders[k] = v; });
             DebugLog.info(`  응답 헤더: ${JSON.stringify(respHeaders)}`);
         }
 
-        // Anthropic 응답을 OpenAI 포맷으로 변환 (SillyTavern이 파싱할 수 있도록)
         if (isAnthropic && response.ok) {
             try {
                 return await this.convertAnthropicResponse(response, body.stream);
@@ -671,16 +1005,24 @@ const Interceptor = {
             }
         }
 
-        // ━━━ passthrough/openai: 응답을 그대로 반환 (다른 확장 호환성 보장) ━━━
-        // 디버그 로그도 response를 건드리므로 완전히 제거
+        if (isResponses && response.ok) {
+            try {
+                return await this.handleResponsesResponse(response, {
+                    stream: !!body.stream,
+                    model: body.model,
+                });
+            } catch (e) {
+                DebugLog.error("Responses 응답 변환 실패:", String(e));
+                return new Response(JSON.stringify(normalizeResponsesError(e, null, 500)), {
+                    status: 500,
+                    headers: { "Content-Type": "application/json" },
+                });
+            }
+        }
 
         return response;
     },
 
-    /**
-     * Anthropic 응답을 OpenAI Chat Completion 포맷으로 변환
-     * SillyTavern은 OpenAI 포맷을 기대하므로
-     */
     async convertAnthropicResponse(response, isStream) {
         if (isStream) {
             // 스트리밍: Anthropic SSE → OpenAI SSE 변환
@@ -692,28 +1034,43 @@ const Interceptor = {
             let textAccum = ""; // 본문 내용 누적
             let streamStartTime = Date.now();
             let firstChunkTime = null;
+            let doneSent = false;
+
+            const logAnthropicSummary = () => {
+                const streamElapsed = Date.now() - streamStartTime;
+                const ttfb = firstChunkTime ? firstChunkTime - streamStartTime : 0;
+                DebugLog.info(`━━━ 스트리밍 완료 ━━━`);
+                DebugLog.info(`  총 소요: ${streamElapsed}ms (${(streamElapsed/1000).toFixed(1)}초)`);
+                DebugLog.info(`  TTFB (첫 청크): ${ttfb}ms`);
+                DebugLog.info(`  본문: ${textAccum.length}자`);
+                if (thinkingAccum) {
+                    DebugLog.info(`  ⚡ 추론: ${thinkingAccum.length}자`);
+                    DebugLog.add("REQ", `━━━ 추론 내용 ━━━\n${thinkingAccum}\n━━━ 추론 끝 ━━━`);
+                } else {
+                    DebugLog.info(`  추론: ❌ 없음`);
+                }
+                DebugLog.info(`━━━━━━━━━━━━━━━`);
+            };
+
+            const finalizeAnthropic = (controller) => {
+                if (doneSent) return;
+                doneSent = true;
+                if (inThinking) {
+                    const tag = { choices: [{ delta: { content: "\n</thinking>\n\n" }, index: 0 }] };
+                    controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(tag)}\n\n`));
+                    inThinking = false;
+                }
+                controller.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
+                logAnthropicSummary();
+                controller.close();
+            };
 
             const stream = new ReadableStream({
                 async pull(controller) {
                     try {
                     const { done, value } = await reader.read();
                     if (done) {
-                        // ━━━ 스트리밍 완료 요약 ━━━
-                        const streamElapsed = Date.now() - streamStartTime;
-                        const ttfb = firstChunkTime ? firstChunkTime - streamStartTime : 0;
-                        DebugLog.info(`━━━ 스트리밍 완료 ━━━`);
-                        DebugLog.info(`  총 소요: ${streamElapsed}ms (${(streamElapsed/1000).toFixed(1)}초)`);
-                        DebugLog.info(`  TTFB (첫 청크): ${ttfb}ms`);
-                        DebugLog.info(`  본문: ${textAccum.length}자`);
-                        if (thinkingAccum) {
-                            DebugLog.info(`  ⚡ 추론: ${thinkingAccum.length}자`);
-                            DebugLog.add("REQ", `━━━ 추론 내용 ━━━\n${thinkingAccum}\n━━━ 추론 끝 ━━━`);
-                        } else {
-                            DebugLog.info(`  추론: ❌ 없음`);
-                        }
-                        DebugLog.info(`━━━━━━━━━━━━━━━`);
-                        controller.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
-                        controller.close();
+                        finalizeAnthropic(controller);
                         return;
                     }
 
@@ -788,24 +1145,17 @@ const Interceptor = {
                             }
                             // 스트림 종료
                             else if (event.type === "message_stop") {
-                                if (inThinking) {
-                                    const tag = { choices: [{ delta: { content: "\n</thinking>\n\n" }, index: 0 }] };
-                                    controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(tag)}\n\n`));
-                                    inThinking = false;
-                                }
-                                controller.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
+                                finalizeAnthropic(controller);
+                                return;
                             }
                             // 스트림 중 에러
                             else if (event.type === "error") {
                                 const errMsg = event.error?.message || "Unknown error";
                                 DebugLog.error(`[스트림] 에러 이벤트: ${errMsg}`);
-                                if (inThinking) {
-                                    const tag = { choices: [{ delta: { content: "\n</thinking>\n\n" }, index: 0 }] };
-                                    controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(tag)}\n\n`));
-                                    inThinking = false;
-                                }
                                 const errChunk = { choices: [{ delta: { content: `\n[Error: ${errMsg}]\n` }, index: 0 }] };
                                 controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(errChunk)}\n\n`));
+                                finalizeAnthropic(controller);
+                                return;
                             }
                         } catch { /* skip malformed JSON */ }
                     }
@@ -899,6 +1249,217 @@ const Interceptor = {
         }
     },
 
+
+
+    async handleResponsesResponse(response, options = {}) {
+        // Responses는 요청/응답/스트림 스키마가 달라서 ST용 OpenAI 계약으로 다시 감싼다.
+        DebugLog.info(`[Responses 핸들러] stream=${options.stream}, model=${options.model}`);
+        if (options.stream) {
+            return this.pipeResponsesStreamAsOpenAI(response, options);
+        }
+
+        const responseText = await response.text();
+        let data;
+        try {
+            data = JSON.parse(responseText);
+        } catch (error) {
+            DebugLog.error("Responses 응답 JSON 파싱 실패:", String(error));
+            return new Response(JSON.stringify(normalizeResponsesError(error, responseText, 502)), {
+                status: 502,
+                headers: { "Content-Type": "application/json" },
+            });
+        }
+
+        const assistantText = extractResponsesOutputText(data);
+        const reasoningText = extractResponsesReasoningText(data);
+        DebugLog.info(`━━━ Responses 응답 분석 ━━━`);
+        DebugLog.info(`  모델: ${data.model || "(없음)"}`);
+        DebugLog.info(`  status: ${data.status || "(없음)"}`);
+        DebugLog.info(`  finish_reason: ${mapResponsesFinishReason(data)}`);
+        DebugLog.info(`  output items: ${Array.isArray(data.output) ? data.output.length : 0}개`);
+        DebugLog.info(`  본문 길이: ${assistantText.length}자`);
+        if (reasoningText) {
+            DebugLog.info(`  추론 길이: ${reasoningText.length}자`);
+            DebugLog.add("REQ", `━━━ Responses 추론 내용 ━━━\n${reasoningText}\n━━━ Responses 추론 끝 ━━━`);
+        } else {
+            DebugLog.info("  추론: ❌ 없음");
+        }
+        DebugLog.info(`━━━━━━━━━━━━━━━`);
+
+        const openAIResponse = convertResponsesToOpenAIResponse(data, {
+            id: options.id,
+            model: options.model,
+            created: options.created,
+        });
+
+        return new Response(JSON.stringify(openAIResponse), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+        });
+    },
+
+    async pipeResponsesStreamAsOpenAI(response, options = {}) {
+        DebugLog.info(`[Responses 스트림] 파이프 시작`);
+        const reader = response.body?.getReader?.();
+        if (!reader) {
+            DebugLog.error("[Responses 스트림] reader 생성 실패");
+            return new Response(JSON.stringify(normalizeResponsesError(new Error("Responses 스트림 body 없음"), null, 502)), {
+                status: 502, headers: { "Content-Type": "application/json" },
+            });
+        }
+
+        const decoder = new TextDecoder();
+        let buffer = "";
+        let inThinking = false;
+        let thinkingAccum = "";
+        let textAccum = "";
+        let streamStartTime = Date.now();
+        let firstChunkTime = null;
+        let doneSent = false;
+        let sseEventType = "";
+
+        const logSummary = () => {
+            const elapsed = Date.now() - streamStartTime;
+            const ttfb = firstChunkTime ? firstChunkTime - streamStartTime : 0;
+            DebugLog.info(`━━━ Responses 스트리밍 완료 ━━━`);
+            DebugLog.info(`  총 소요: ${elapsed}ms (${(elapsed / 1000).toFixed(1)}초)`);
+            DebugLog.info(`  TTFB: ${ttfb}ms`);
+            DebugLog.info(`  본문: ${textAccum.length}자`);
+            if (thinkingAccum) {
+                DebugLog.info(`  추론: ${thinkingAccum.length}자`);
+                DebugLog.add("REQ", `━━━ Responses 추론 내용 ━━━\n${thinkingAccum}\n━━━ Responses 추론 끝 ━━━`);
+            } else {
+                DebugLog.info("  추론: ❌ 없음");
+            }
+            DebugLog.info("━━━━━━━━━━━━━━━");
+        };
+
+        const finalize = (controller) => {
+            if (doneSent) return;
+            doneSent = true;
+            if (inThinking) {
+                const tag = { choices: [{ delta: { content: "\n</thinking>\n\n" }, index: 0 }] };
+                controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(tag)}\n\n`));
+                inThinking = false;
+            }
+            controller.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
+            logSummary();
+            controller.close();
+        };
+
+        const stream = new ReadableStream({
+            async pull(controller) {
+                // 메타데이터 전용 청크에서 멈추지 않도록
+                // 실제 content를 enqueue하거나 스트림이 끝날 때까지 계속 읽음
+                while (true) {
+                try {
+                    const { done, value } = await reader.read();
+                    if (done) {
+                        finalize(controller);
+                        return;
+                    }
+
+                    if (!firstChunkTime) firstChunkTime = Date.now();
+
+                    buffer += decoder.decode(value, { stream: true });
+                    const lines = buffer.split("\n");
+                    buffer = lines.pop() || "";
+
+                    let didEnqueue = false;
+
+                    for (const line of lines) {
+                        if (line.startsWith("event:")) {
+                            sseEventType = line.slice(6).trim();
+                            continue;
+                        }
+                        if (!line.startsWith("data:")) continue;
+                        const dataStr = line.slice(5).trim();
+                        if (!dataStr) continue;
+                        if (dataStr === "[DONE]") {
+                            finalize(controller);
+                            return;
+                        }
+
+                        let event;
+                        try { event = JSON.parse(dataStr); } catch { continue; }
+
+                        const type = event.type || sseEventType;
+
+                        // 텍스트 델타
+                        if (type === "response.output_text.delta") {
+                            const text = event.delta || "";
+                            if (!text) continue;
+                            if (inThinking) {
+                                const tag = { choices: [{ delta: { content: "\n</thinking>\n\n" }, index: 0 }] };
+                                controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(tag)}\n\n`));
+                                inThinking = false;
+                            }
+                            textAccum += text;
+                            const chunk = { choices: [{ delta: { content: text }, index: 0 }] };
+                            controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(chunk)}\n\n`));
+                            didEnqueue = true;
+                        }
+                        // 추론 델타
+                        else if (type === "response.reasoning_summary_text.delta" || type === "response.reasoning_text.delta") {
+                            const text = event.delta || "";
+                            if (!text) continue;
+                            if (!inThinking) {
+                                inThinking = true;
+                                const tag = { choices: [{ delta: { content: "<thinking>\n" }, index: 0 }] };
+                                controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(tag)}\n\n`));
+                            }
+                            thinkingAccum += text;
+                            const chunk = { choices: [{ delta: { content: text }, index: 0 }] };
+                            controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(chunk)}\n\n`));
+                            didEnqueue = true;
+                        }
+                        // 거부 델타
+                        else if (type === "response.refusal.delta") {
+                            const text = event.delta || "";
+                            if (text) {
+                                textAccum += text;
+                                const chunk = { choices: [{ delta: { content: text }, index: 0 }] };
+                                controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(chunk)}\n\n`));
+                                didEnqueue = true;
+                            }
+                        }
+                        // 에러
+                        else if (type === "response.failed" || type === "error") {
+                            const errMsg = event.error?.message || event.message || "Unknown error";
+                            DebugLog.error(`[Responses 스트림] ${errMsg}`);
+                            const errChunk = { choices: [{ delta: { content: `\n[Error: ${errMsg}]\n` }, index: 0 }] };
+                            controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(errChunk)}\n\n`));
+                            finalize(controller);
+                            return;
+                        }
+                        // 스트림 종료
+                        else if (type === "response.completed" || type === "response.incomplete") {
+                            finalize(controller);
+                            return;
+                        }
+                        // 나머지 (메타데이터 등): 무시
+                    }
+
+                    if (didEnqueue) return; // 콘텐츠 전달 완료 → pull 종료
+                    // 콘텐츠 없는 메타데이터 청크 → while 루프로 다음 청크 읽기
+                } catch (e) {
+                    DebugLog.error("Responses 스트림 읽기 실패:", String(e));
+                    try {
+                        controller.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
+                        controller.close();
+                    } catch { /* already closed */ }
+                    return;
+                }
+                } // while
+            },
+        });
+
+        return new Response(stream, {
+            status: 200,
+            headers: { "Content-Type": "text/event-stream" },
+        });
+    },
+
     install() {
         if (this.active) return;
         this.originalFetch = window.fetch;
@@ -979,6 +1540,7 @@ function updateStatus() {
             "anthropic-thinking": "Anthropic 추론 (/v1/messages)",
             "openai": "OpenAI (/chat/completions)",
             "passthrough": "패스스루 (/chat/completions)",
+            "responses": "Responses (/responses)",
         };
         el.text(`✅ 활성 — ${labels[s.endpoint] || s.endpoint}`).css("color", "#4CAF50");
     } else {
@@ -1008,7 +1570,7 @@ jQuery(async () => {
         s.endpoint = $(this).val();
         saveSettings();
         DebugLog.info("엔드포인트:", s.endpoint);
-        $(".cpi-openai-only").toggle(s.endpoint === "openai");
+        $(".cpi-openai-only").toggle(s.endpoint === "openai" || s.endpoint === "responses");
         $(".cpi-thinking-only").toggle(s.endpoint === "anthropic-thinking");
         $(".cpi-passthrough-only").toggle(s.endpoint === "passthrough");
         updateStatus();
@@ -1177,7 +1739,7 @@ jQuery(async () => {
     $("#cpi_chat_version").val(s.chatVersion);
     $("#cpi_code_version").val(s.codeVersion);
 
-    $(".cpi-openai-only").toggle(s.endpoint === "openai");
+    $(".cpi-openai-only").toggle(s.endpoint === "openai" || s.endpoint === "responses");
     $(".cpi-thinking-only").toggle(s.endpoint === "anthropic-thinking");
     $(".cpi-passthrough-only").toggle(s.endpoint === "passthrough");
     if (!s.debugLog) $("#cpi_log_panel").hide();
