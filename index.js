@@ -1,4 +1,4 @@
-﻿// CPI - Copilot Interceptor
+// CPI - Copilot Interceptor
 // OpenAI (/chat/completions) 또는 Anthropic (/v1/messages) 엔드포인트 선택 가능
 import { extension_settings } from "../../../extensions.js";
 import { saveSettingsDebounced } from "../../../../script.js";
@@ -785,6 +785,12 @@ const Interceptor = {
             delete body.include_reasoning;
             delete body.reasoning_effort;
 
+            // logprobs: 숫자 → boolean 변환 (Copilot API는 boolean만 허용)
+            if (body.logprobs != null && typeof body.logprobs !== "boolean") {
+                body.logprobs = !!body.logprobs;
+                DebugLog.info("logprobs 타입 변환: number → boolean");
+            }
+
             // 빈 content 메시지 제거
             if (Array.isArray(body.messages)) {
                 body.messages = body.messages.filter((m) => {
@@ -887,6 +893,12 @@ const Interceptor = {
                     DebugLog.warn(`마지막 role 변환: ${last.role} → user`);
                     last.role = "user";
                 }
+            }
+
+            // logprobs: 숫자 → boolean 변환 (Copilot API는 boolean만 허용)
+            if (body.logprobs != null && typeof body.logprobs !== "boolean") {
+                body.logprobs = !!body.logprobs;
+                DebugLog.info("logprobs 타입 변환: number → boolean");
             }
 
             if (isResponses) {
@@ -1018,6 +1030,26 @@ const Interceptor = {
                     headers: { "Content-Type": "application/json" },
                 });
             }
+        }
+
+        // ━━━ passthrough/openai: 비스트리밍일 때 clone으로 응답 로그 ━━━
+        if (response.ok && !body.stream && getSettings().debugLog) {
+            try {
+                const cloned = response.clone();
+                cloned.json().then(data => {
+                    const content = data.choices?.[0]?.message?.content || "";
+                    const model = data.model || "(없음)";
+                    const usage = data.usage;
+                    DebugLog.info(`━━━ 패스스루 응답 ━━━`);
+                    DebugLog.info(`  모델: ${model}`);
+                    if (usage) {
+                        DebugLog.info(`  prompt_tokens: ${usage.prompt_tokens || 0}`);
+                        DebugLog.info(`  completion_tokens: ${usage.completion_tokens || 0}`);
+                    }
+                    DebugLog.info(`  본문 길이: ${content.length}자`);
+                    DebugLog.add("RES", `━━━ 응답 본문 ━━━\n${content}\n━━━ 응답 끝 ━━━`);
+                }).catch(() => {});
+            } catch {}
         }
 
         return response;
