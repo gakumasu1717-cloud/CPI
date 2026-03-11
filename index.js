@@ -668,35 +668,35 @@ function normalizeResponsesError(error, responseText, status) {
 // Copilot 인터셉터
 // ============================================================
 const Interceptor = {
-    tidToken: "",
-    tidTokenExpiry: 0,
+    sessionToken: "",
+    sessionTokenExpiry: 0,
     machineId: "",
     sessionId: "",
     originalFetch: null,
     active: false,
 
-    async refreshTidToken(apiKey) {
+    async refreshSessionToken(apiKey) {
         if (!apiKey) return "";
-        if (this.tidToken && Date.now() < this.tidTokenExpiry - 60000) {
-            DebugLog.info("tid 토큰 캐시 사용");
-            return this.tidToken;
+        if (this.sessionToken && Date.now() < this.sessionTokenExpiry - 60000) {
+            DebugLog.info("세션 토큰 캐시 사용");
+            return this.sessionToken;
         }
         try {
-            DebugLog.info("tid 토큰 갱신 요청...");
+            DebugLog.info("세션 토큰 갱신 요청...");
             const res = await this.originalFetch.call(window, COPILOT_INTERNAL_TOKEN_URL, {
                 method: "GET",
                 headers: { "Accept": "application/json", "Authorization": `Bearer ${apiKey}`, "Origin": "vscode-file://vscode-app" },
             });
-            if (!res.ok) { DebugLog.error("tid 갱신 실패:", res.status); return ""; }
+            if (!res.ok) { DebugLog.error("세션 토큰 갱신 실패:", res.status); return ""; }
             const data = await res.json();
             if (data.token && data.expires_at) {
-                this.tidToken = data.token;
-                this.tidTokenExpiry = data.expires_at * 1000;
-                DebugLog.info("tid 토큰 갱신 성공");
-                return this.tidToken;
+                this.sessionToken = data.token;
+                this.sessionTokenExpiry = data.expires_at * 1000;
+                DebugLog.info("세션 토큰 갱신 성공");
+                return this.sessionToken;
             }
             return "";
-        } catch (e) { DebugLog.error("tid 오류:", String(e)); return ""; }
+        } catch (e) { DebugLog.error("세션 토큰 오류:", String(e)); return ""; }
     },
 
     buildVscodeHeaders() {
@@ -746,8 +746,8 @@ const Interceptor = {
         }
 
         if (s.useVscodeHeaders) {
-            const tidToken = await this.refreshTidToken(token);
-            headers["Authorization"] = `Bearer ${tidToken || token}`;
+            const sessionToken = await this.refreshSessionToken(token);
+            headers["Authorization"] = `Bearer ${sessionToken || token}`;
             Object.assign(headers, this.buildVscodeHeaders());
             DebugLog.info("VSCode 위장 헤더 적용");
         } else {
@@ -1547,8 +1547,8 @@ const Interceptor = {
     },
 
     reset() {
-        this.tidToken = "";
-        this.tidTokenExpiry = 0;
+        this.sessionToken = "";
+        this.sessionTokenExpiry = 0;
         this.machineId = "";
         this.sessionId = "";
         DebugLog.info("세션/토큰 초기화됨");
