@@ -1,92 +1,84 @@
-<div class="cfa-settings">
+<div class="cpi-settings">
     <div class="inline-drawer">
         <div class="inline-drawer-toggle inline-drawer-header">
-            <b>CFA - Custom Format Adapter</b>
+            <b>CPI - Copilot Interceptor</b>
             <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
         </div>
         <div class="inline-drawer-content">
 
-            <div class="cfa-section">
-                <p id="cfa_status" class="cfa-status">로딩 중...</p>
+            <div class="cpi-section">
+                <p id="cpi_status" class="cpi-status">로딩 중...</p>
             </div>
 
             <hr class="sysHR" />
 
-            <!-- API key (선택) -->
-            <div class="cfa-section">
-                <h4><i class="fa-solid fa-key"></i> API Key (선택)</h4>
-                <select id="cfa_token_select" class="text_pole" style="font-size:13px;margin-bottom:6px;">
-                    <option value="">-- 키 선택 (비우면 연결 프로필 키 사용) --</option>
+            <!-- 토큰 설정 -->
+            <div class="cpi-section">
+                <h4><i class="fa-solid fa-key"></i> Copilot 토큰</h4>
+                <select id="cpi_token_select" class="text_pole" style="font-size:13px;margin-bottom:6px;">
+                    <option value="">-- 토큰 선택 (비어있으면 GCM 폴백) --</option>
                 </select>
                 <div style="display:flex;gap:4px;margin-bottom:8px;">
-                    <input id="cfa_token_name" type="text" class="text_pole" placeholder="이름 (예: 메인)" style="font-size:12px;flex:1;" />
-                    <input id="cfa_token_value" type="password" class="text_pole" placeholder="sk-... / API key" style="font-size:12px;flex:2;" />
+                    <input id="cpi_token_name" type="text" class="text_pole" placeholder="이름 (예: 메인계정)" style="font-size:12px;flex:1;" />
+                    <input id="cpi_token_value" type="password" class="text_pole" placeholder="gho_xxxx..." style="font-size:12px;flex:2;" />
                 </div>
                 <div style="display:flex;gap:4px;">
-                    <input id="cfa_token_add" class="menu_button" type="button" value="➕ 추가" style="font-size:11px;padding:3px 10px;" />
-                    <input id="cfa_token_delete" class="menu_button" type="button" value="🗑️ 삭제" style="font-size:11px;padding:3px 10px;" />
+                    <input id="cpi_token_add" class="menu_button" type="button" value="➕ 추가" style="font-size:11px;padding:3px 10px;" />
+                    <input id="cpi_token_delete" class="menu_button" type="button" value="🗑️ 삭제" style="font-size:11px;padding:3px 10px;" />
                 </div>
-                <small class="cfa-dim">보통은 비워두세요. 비어있으면 연결 프로필의 API key를 그대로 사용합니다.</small>
+                <small class="cpi-dim">토큰을 저장하고 드롭다운에서 전환. 비어있으면 GCM 폴백.</small>
             </div>
 
             <hr class="sysHR" />
 
-            <!-- 포맷 선택 -->
-            <div class="cfa-section">
-                <h4><i class="fa-solid fa-route"></i> 전송 포맷</h4>
-                <select id="cfa_endpoint" class="text_pole" style="font-size:13px;">
-                    <option value="anthropic">Anthropic (messages) — 클로드 권장</option>
-                    <option value="anthropic-thinking">Anthropic 추론 — 확장 추론</option>
-                    <option value="openai">OpenAI (chat/completions) — 호환</option>
-                    <option value="responses">Responses — ST 호환 어댑터</option>
-                    <option value="passthrough">패스스루 — 변환 없이 그대로</option>
+            <!-- 엔드포인트 선택 -->
+            <div class="cpi-section">
+                <h4><i class="fa-solid fa-route"></i> 엔드포인트</h4>
+                <select id="cpi_endpoint" class="text_pole" style="font-size:13px;">
+                    <option value="anthropic">Anthropic (/v1/messages) — 클로드 권장</option>
+                    <option value="anthropic-thinking">Anthropic 추론 (/v1/messages) — 확장 추론</option>
+                    <option value="openai">OpenAI (/chat/completions) — 클로드 호환</option>
+                                                            <option value="responses">Responses (/responses) — ST 호환 어댑터</option>
+                    <option value="passthrough">패스스루 (/chat/completions) — 변환 없이 그대로 (제미니 등)</option>
                 </select>
-                <small class="cfa-dim">메시지 body를 어떤 포맷으로 변환해 보낼지 선택.<br>Anthropic: system role 지원, 클로드 네이티브 포맷<br>패스스루: 인증/정리만 하고 body 변환 없음</small>
-            </div>
-
-            <hr class="sysHR" />
-
-            <!-- 엔드포인트 경로 보정 -->
-            <div class="cfa-section">
-                <h4><i class="fa-solid fa-link"></i> 엔드포인트</h4>
-                <small class="cfa-dim" style="display:block;margin-bottom:6px;">전송 대상은 연결 프로필의 custom URL을 <b>그대로</b> 사용합니다.</small>
-                <label class="checkbox_label cfa-toggle">
-                    <input id="cfa_path_correction" type="checkbox" />
-                    <span>경로 보정</span>
-                    <small class="cfa-dim cfa-toggle-desc">ON: 포맷에 맞는 경로(/v1/messages 등)를 custom URL에 자동 추가</small>
-                </label>
+                <small class="cpi-dim">Anthropic: system role 완벽 지원, 클로드 네이티브 포맷<br>Anthropic 추론: 확장 추론 활성화 (temperature 무시)<br>OpenAI: 호환성 높지만 system 처리가 다를 수 있음<br>패스스루: 인증/헤더만 처리, body 변환 없음</small>
             </div>
 
             <hr class="sysHR" />
 
             <!-- 추론 Budget (Anthropic 추론 전용) -->
-            <div class="cfa-section cfa-thinking-only">
+            <div class="cpi-section cpi-thinking-only">
                 <h4><i class="fa-solid fa-brain"></i> 추론 설정 (Anthropic)</h4>
-                <div class="cfa-version-row">
-                    <label for="cfa_adaptive_thinking">Adaptive Thinking:</label>
-                    <input id="cfa_adaptive_thinking" type="checkbox" />
-                    <small class="cfa-dim" style="margin-left:8px;">모델이 추론 깊이를 자동 결정 (Opus 4.6+)</small>
+                <div class="cpi-version-row">
+                    <label for="cpi_adaptive_thinking">Adaptive Thinking:</label>
+                    <input id="cpi_adaptive_thinking" type="checkbox" />
+                    <small class="cpi-dim" style="margin-left:8px;">모델이 추론 깊이를 자동 결정 (Opus 4.6+, Copilot 미지원 가능)</small>
                 </div>
-                <div class="cfa-version-row cfa-budget-row">
-                    <label for="cfa_thinking_budget">Budget 토큰:</label>
-                    <input id="cfa_thinking_budget" type="number" class="text_pole" value="10000" min="1000" max="100000" step="1000" placeholder="10000" />
+                <div class="cpi-version-row cpi-budget-row">
+                    <label for="cpi_thinking_budget">Budget 토큰:</label>
+                    <input id="cpi_thinking_budget" type="number" class="text_pole" value="10000" min="1000" max="100000" step="1000" placeholder="10000" />
                 </div>
-                <small class="cfa-dim">Adaptive OFF: 고정 budget 사용. Adaptive ON: budget 무시, 모델이 자동 조절.</small>
+                <small class="cpi-dim">Adaptive OFF: 고정 budget 사용. Adaptive ON: budget 무시, 모델이 자동 조절.</small>
             </div>
 
             <hr class="sysHR" />
 
             <!-- 메인 설정 -->
-            <div class="cfa-section">
+            <div class="cpi-section">
                 <h4><i class="fa-solid fa-gear"></i> 설정</h4>
 
-                <label class="checkbox_label cfa-toggle">
-                    <input id="cfa_enabled" type="checkbox" checked />
-                    <span>전체 활성화 (ON이면 custom 엔드포인트 요청을 가로채 변환)</span>
+                <label class="checkbox_label cpi-toggle">
+                    <input id="cpi_enabled" type="checkbox" checked />
+                    <span>인터셉터 활성화</span>
                 </label>
 
-                <label class="checkbox_label cfa-toggle">
-                    <input id="cfa_basic_auth_compat" type="checkbox" />
+                <label class="checkbox_label cpi-toggle">
+                    <input id="cpi_use_vscode_headers" type="checkbox" checked />
+                    <span>VSCode 위장 헤더 (권장)</span>
+                </label>
+
+                <label class="checkbox_label cpi-toggle">
+                    <input id="cpi_basic_auth_compat" type="checkbox" />
                     <span>basicAuth 호환 모드</span>
                 </label>
             </div>
@@ -94,46 +86,62 @@
             <hr class="sysHR" />
 
             <!-- OpenAI 전용 보정 옵션 -->
-            <div class="cfa-section cfa-openai-only">
-                <h4><i class="fa-solid fa-wrench"></i> 보정 옵션 (OpenAI/Responses 전용)</h4>
+            <div class="cpi-section cpi-openai-only">
+                                <h4><i class="fa-solid fa-wrench"></i> OpenAI 전용 보정 옵션 (OpenAI/Responses 전용)</h4>
 
-                <label class="checkbox_label cfa-toggle">
-                    <input id="cfa_remove_prefill" type="checkbox" checked />
+                <label class="checkbox_label cpi-toggle">
+                    <input id="cpi_remove_prefill" type="checkbox" checked />
                     <span>프리필 자동 제거</span>
-                    <small class="cfa-dim cfa-toggle-desc">마지막 assistant 메시지 제거</small>
+                    <small class="cpi-dim cpi-toggle-desc">마지막 assistant 메시지 제거</small>
                 </label>
 
-                <label class="checkbox_label cfa-toggle">
-                    <input id="cfa_trim_assistant" type="checkbox" checked />
+                <label class="checkbox_label cpi-toggle">
+                    <input id="cpi_trim_assistant" type="checkbox" checked />
                     <span>assistant 끝 공백 제거 (trim)</span>
-                    <small class="cfa-dim cfa-toggle-desc">trailing whitespace 에러 방지</small>
+                    <small class="cpi-dim cpi-toggle-desc">trailing whitespace 에러 방지</small>
                 </label>
 
-                <label class="checkbox_label cfa-toggle">
-                    <input id="cfa_force_last_user" type="checkbox" checked />
+                <label class="checkbox_label cpi-toggle">
+                    <input id="cpi_force_last_user" type="checkbox" checked />
                     <span>마지막 메시지 user 강제</span>
-                    <small class="cfa-dim cfa-toggle-desc">system으로 끝나는 경우 user로 변환</small>
+                    <small class="cpi-dim cpi-toggle-desc">system으로 끝나는 경우 user로 변환</small>
                 </label>
             </div>
 
             <hr class="sysHR" />
 
+            <!-- 버전 -->
+            <div class="cpi-section">
+                <h4><i class="fa-solid fa-code-branch"></i> 버전</h4>
+                <div class="cpi-version-row">
+                    <label for="cpi_chat_version">Copilot Chat:</label>
+                    <input id="cpi_chat_version" type="text" class="text_pole" value="0.38.2026020704" placeholder="0.38.2026020704" />
+                </div>
+                <div class="cpi-version-row">
+                    <label for="cpi_code_version">VSCode:</label>
+                    <input id="cpi_code_version" type="text" class="text_pole" value="1.109.0" placeholder="1.109.0" />
+                </div>
+                <input id="cpi_reset_session" class="menu_button" type="button" value="🔄 세션 초기화" style="margin-top:6px;" />
+            </div>
+
+            <hr class="sysHR" />
+
             <!-- 디버그 로그 -->
-            <div class="cfa-section">
+            <div class="cpi-section">
                 <h4><i class="fa-solid fa-terminal"></i> 디버그 로그</h4>
-                <div class="cfa-log-toolbar">
+                <div class="cpi-log-toolbar">
                     <label class="checkbox_label" style="margin:0;">
-                        <input id="cfa_debug_log" type="checkbox" checked />
+                        <input id="cpi_debug_log" type="checkbox" checked />
                         <span>로그 표시</span>
                     </label>
                     <div style="display:flex;gap:4px;">
-                        <input id="cfa_fold_all" class="menu_button" type="button" value="📁 모두 접기" style="width:auto;padding:2px 8px;font-size:11px;" />
-                        <input id="cfa_scroll_bottom" class="menu_button" type="button" value="⬇ 맨아래" style="width:auto;padding:2px 8px;font-size:11px;" />
-                        <input id="cfa_clear_log" class="menu_button" type="button" value="🗑️ 초기화" style="width:auto;padding:2px 10px;font-size:11px;" />
+                        <input id="cpi_fold_all" class="menu_button" type="button" value="📁 모두 접기" style="width:auto;padding:2px 8px;font-size:11px;" />
+                        <input id="cpi_scroll_bottom" class="menu_button" type="button" value="⬇ 맨아래" style="width:auto;padding:2px 8px;font-size:11px;" />
+                        <input id="cpi_clear_log" class="menu_button" type="button" value="🗑️ 초기화" style="width:auto;padding:2px 10px;font-size:11px;" />
                     </div>
                 </div>
-                <div id="cfa_log_panel">
-                    <div id="cfa_log_content" class="cfa-log-box">
+                <div id="cpi_log_panel">
+                    <div id="cpi_log_content" class="cpi-log-box">
                         <div style="color:#666;">로그 대기 중...</div>
                     </div>
                 </div>
