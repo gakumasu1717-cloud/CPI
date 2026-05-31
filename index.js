@@ -1,17 +1,13 @@
-// CPI - Copilot Interceptor
-// OpenAI (/chat/completions) 또는 Anthropic (/v1/messages) 엔드포인트 선택 가능
+// CFA - Custom Format Adapter
+// 연결 프로필의 custom 엔드포인트로 메시지 포맷만 변환해 전송
 import { extension_settings } from "../../../extensions.js";
 import { saveSettingsDebounced } from "../../../../script.js";
 
-const extensionName = "CPI";
+const extensionName = "CFA";
 const extensionFolderPath = `scripts/extensions/third-party/${extensionName}`;
-
-const COPILOT_API_BASE = "https://api.githubcopilot.com";
-const COPILOT_INTERNAL_TOKEN_URL = "https://api.github.com/copilot_internal/v2/token";
 
 const defaultSettings = {
     enabled: true,
-    useVscodeHeaders: true,
     removePrefill: true,
     trimAssistant: true,
     forceLastUser: true,
@@ -19,12 +15,11 @@ const defaultSettings = {
     debugLog: true,
     endpoint: "anthropic",  // "openai", "anthropic", "anthropic-thinking", "passthrough", "responses"
     thinkingBudget: 10000,  // thinking budget_tokens
-    adaptiveThinking: false, // adaptive thinking (Opus 4.6+, Copilot 미지원 가능)
+    adaptiveThinking: false, // adaptive thinking (Opus 4.6+)
+    pathCorrection: false,   // 엔드포인트 경로 자동 보정 (custom_url 에 포맷별 경로 추가)
 
-    token: "",  // 현재 선택된 토큰
-    tokens: [],  // 저장된 토큰 목록 [{name, value}]
-    chatVersion: "0.38.2026020704",
-    codeVersion: "1.109.0",
+    token: "",  // 수동 입력 API key (선택, 비우면 연결 프로필 키 사용)
+    tokens: [],  // 저장된 key 목록 [{name, value}]
 };
 
 const LOG_MAX = 200;
@@ -42,8 +37,8 @@ const DebugLog = {
 
         // 디버그 꺼져있으면 ERROR/WARN만 콘솔에 출력하고 끝
         if (!s.debugLog) {
-            if (level === "ERROR") console.error(`[CPI] ${args.join(" ")}`);
-            else if (level === "WARN") console.warn(`[CPI] ${args.join(" ")}`);
+            if (level === "ERROR") console.error(`[CFA] ${args.join(" ")}`);
+            else if (level === "WARN") console.warn(`[CFA] ${args.join(" ")}`);
             return;
         }
 
@@ -55,9 +50,9 @@ const DebugLog = {
         this.entries.push({ time, level, msg });
         if (this.entries.length > LOG_MAX) this.entries.shift();
 
-        if (level === "ERROR") console.error(`[CPI] ${msg}`);
-        else if (level === "WARN") console.warn(`[CPI] ${msg}`);
-        else console.log(`[CPI] ${msg}`);
+        if (level === "ERROR") console.error(`[CFA] ${msg}`);
+        else if (level === "WARN") console.warn(`[CFA] ${msg}`);
+        else console.log(`[CFA] ${msg}`);
 
         // 디바운스 렌더링 (200ms 내 중복 호출 방지)
         if (!this._renderTimer) {
@@ -142,13 +137,13 @@ const DebugLog = {
         const header = `<span style="color:#666;">[${e.time}]</span> <span style="color:${c};font-weight:bold;">[${e.level}]</span> `;
         if (e.msg.length > FOLD_THRESHOLD) {
             const preview = escapeHtmlBr(e.msg.substring(0, FOLD_THRESHOLD));
-            return `<div style="margin:1px 0;">${header}<span class="cpi-fold" data-idx="${idx}"><span class="cpi-fold-short" style="color:#ddd;">${preview}<span class="cpi-fold-btn" data-action="expand" style="color:#64b5f6;cursor:pointer;margin-left:4px;">▼ 펼치기</span></span><span class="cpi-fold-long" style="display:none;color:#ddd;">${escaped}<br><span class="cpi-fold-btn" data-action="collapse" style="color:#64b5f6;cursor:pointer;">▲ 접기</span></span></span></div>`;
+            return `<div style="margin:1px 0;">${header}<span class="cfa-fold" data-idx="${idx}"><span class="cfa-fold-short" style="color:#ddd;">${preview}<span class="cfa-fold-btn" data-action="expand" style="color:#64b5f6;cursor:pointer;margin-left:4px;">▼ 펼치기</span></span><span class="cfa-fold-long" style="display:none;color:#ddd;">${escaped}<br><span class="cfa-fold-btn" data-action="collapse" style="color:#64b5f6;cursor:pointer;">▲ 접기</span></span></span></div>`;
         }
         return `<div style="margin:1px 0;">${header}<span style="color:#ddd;">${escaped}</span></div>`;
     },
 
     render() {
-        const el = $("#cpi_log_content");
+        const el = $("#cfa_log_content");
         if (!el.length) return;
 
         // LOG_MAX으로 shift 됐거나 clear 됐으면 전체 다시 그림
@@ -170,7 +165,7 @@ const DebugLog = {
         });
     },
 
-    clear() { this.entries = []; this._lastRenderedCount = 0; $("#cpi_log_content").html(""); },
+    clear() { this.entries = []; this._lastRenderedCount = 0; $("#cfa_log_content").html(""); },
 };
 
 function escapeHtmlBr(s) {
@@ -184,7 +179,7 @@ function escapeHtmlBr(s) {
 let _cachedApiKey = "";
 
 function getToken(requestBody) {
-    // 0. CPI 설정에 직접 입력한 토큰 (최우선)
+    // 0. CFA 설정에 직접 입력한 키 (최우선)
     const s = getSettings();
     if (s.token && s.token.trim()) {
         return s.token.trim();
@@ -211,28 +206,15 @@ function getToken(requestBody) {
                 return _cachedApiKey;
             }
         }
-        for (const [k, v] of Object.entries(headers)) {
-            if (typeof v === "string" && v.startsWith("gho_")) {
-                _cachedApiKey = v.trim();
-                DebugLog.info(`토큰: custom_include_headers.${k} (${v.substring(0, 10)}...)`);
-                return _cachedApiKey;
-            }
-        }
     }
     // 3. 캐시된 토큰
     if (_cachedApiKey) return _cachedApiKey;
-    // 4. GCM 폴백
-    const gcm = extension_settings["GCM"]?.token;
-    if (gcm) {
-        DebugLog.info(`토큰: GCM 폴백 (${gcm.substring(0, 10)}...)`);
-        return gcm;
-    }
     return "";
 }
 
 function hasAnyToken() {
     const s = getSettings();
-    return !!(s.token?.trim() || _cachedApiKey || extension_settings["GCM"]?.token);
+    return !!(s.token?.trim() || _cachedApiKey);
 }
 
 function getSettings() {
@@ -374,14 +356,18 @@ function convertToAnthropicFormat(messages, model, params) {
 // Responses 어댑터 유틸
 // ST(OpenAI-style) 요청/응답을 Responses 포맷으로 변환
 // ============================================================
-function buildTargetUrl(endpoint) {
-    if (endpoint === "anthropic" || endpoint === "anthropic-thinking") {
-        return `${COPILOT_API_BASE}/v1/messages`;
-    }
-    if (endpoint === "responses") {
-        return `${COPILOT_API_BASE}/responses`;
-    }
-    return `${COPILOT_API_BASE}/chat/completions`;
+function buildTargetUrl(endpoint, customUrl) {
+    const raw = (customUrl || "").trim();
+    // 보정 OFF: 연결 프로필의 custom_url 을 그대로 사용 (무조건 custom)
+    if (!getSettings().pathCorrection) return raw;
+
+    // 보정 ON: 포맷에 맞는 경로를 자동으로 덧붙임 (이미 있으면 그대로)
+    const base = raw.replace(/\/+$/, "");
+    let path;
+    if (endpoint === "anthropic" || endpoint === "anthropic-thinking") path = "/v1/messages";
+    else if (endpoint === "responses") path = "/responses";
+    else path = "/chat/completions";
+    return base.endsWith(path) ? base : base + path;
 }
 
 function previewText(text, max = 160) {
@@ -665,78 +651,28 @@ function normalizeResponsesError(error, responseText, status) {
 }
 
 // ============================================================
-// Copilot 인터셉터
+// 인터셉터
 // ============================================================
 const Interceptor = {
-    sessionToken: "",
-    sessionTokenExpiry: 0,
-    machineId: "",
-    sessionId: "",
     originalFetch: null,
     active: false,
 
-    async refreshSessionToken(apiKey) {
-        if (!apiKey) return "";
-        if (this.sessionToken && Date.now() < this.sessionTokenExpiry - 60000) {
-            DebugLog.info("세션 토큰 캐시 사용");
-            return this.sessionToken;
-        }
-        try {
-            DebugLog.info("세션 토큰 갱신 요청...");
-            const res = await this.originalFetch.call(window, COPILOT_INTERNAL_TOKEN_URL, {
-                method: "GET",
-                headers: { "Accept": "application/json", "Authorization": `Bearer ${apiKey}`, "Origin": "vscode-file://vscode-app" },
-            });
-            if (!res.ok) { DebugLog.error("세션 토큰 갱신 실패:", res.status); return ""; }
-            const data = await res.json();
-            if (data.token && data.expires_at) {
-                this.sessionToken = data.token;
-                this.sessionTokenExpiry = data.expires_at * 1000;
-                DebugLog.info("세션 토큰 갱신 성공");
-                return this.sessionToken;
-            }
-            return "";
-        } catch (e) { DebugLog.error("세션 토큰 오류:", String(e)); return ""; }
-    },
-
-    buildVscodeHeaders() {
-        const s = getSettings();
-        const chatVer = s.chatVersion || "0.38.2026020704";
-        const codeVer = s.codeVersion || "1.109.0";
-        if (!this.machineId) {
-            this.machineId = Array.from({ length: 64 }, () => Math.floor(Math.random() * 16).toString(16)).join("");
-        }
-        if (!this.sessionId) {
-            this.sessionId = (crypto.randomUUID?.() || Date.now().toString()) + Date.now().toString();
-        }
-        return {
-            "Copilot-Integration-Id": "vscode-chat",
-            "Editor-Plugin-Version": `copilot-chat/${chatVer}`,
-            "Editor-Version": `vscode/${codeVer}`,
-            "User-Agent": `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Code/${codeVer} Chrome/142.0.7444.265 Electron/39.4.1 Safari/537.36`,
-            "Vscode-Machineid": this.machineId,
-            "Vscode-Sessionid": this.sessionId,
-            "X-Github-Api-Version": "2025-10-01",
-            "X-Initiator": "user",
-            "X-Interaction-Id": crypto.randomUUID?.() || Date.now().toString(),
-            "X-Interaction-Type": "conversation-panel",
-            "X-Request-Id": crypto.randomUUID?.() || Date.now().toString(),
-            "X-Vscode-User-Agent-Library-Version": "electron-fetch",
-        };
-    },
-
     async interceptAndSend(requestBody) {
         const token = getToken(requestBody);
-        if (!token) throw new Error("토큰 없음 — API key 또는 GCM 토큰 필요");
+        if (!token) throw new Error("토큰 없음 — 연결 프로필 API key 필요");
 
         const s = getSettings();
+        const customUrl = (requestBody.custom_url || "").trim();
+        if (!customUrl) throw new Error("custom_url 없음 — 연결 프로필 엔드포인트 필요");
+
         const isAnthropic = s.endpoint === "anthropic" || s.endpoint === "anthropic-thinking";
         const isThinking = s.endpoint === "anthropic-thinking";
         const isResponses = s.endpoint === "responses";
         const isPassthrough = s.endpoint === "passthrough";
-        const url = buildTargetUrl(s.endpoint);
+        const url = buildTargetUrl(s.endpoint, customUrl);
 
         DebugLog.info(`엔드포인트: ${s.endpoint}${isThinking ? " (추론)" : ""} → ${url}`);
+        DebugLog.info(`경로 보정: ${s.pathCorrection ? "ON" : "OFF (custom_url 그대로)"}`);
 
         const headers = { "Content-Type": "application/json" };
         if (isAnthropic) {
@@ -744,16 +680,7 @@ const Interceptor = {
         } else {
             headers["Accept"] = requestBody.stream ? "text/event-stream" : "application/json";
         }
-
-        if (s.useVscodeHeaders) {
-            const sessionToken = await this.refreshSessionToken(token);
-            headers["Authorization"] = `Bearer ${sessionToken || token}`;
-            Object.assign(headers, this.buildVscodeHeaders());
-            DebugLog.info("VSCode 위장 헤더 적용");
-        } else {
-            headers["Authorization"] = `Bearer ${token}`;
-            headers["Copilot-Integration-Id"] = "vscode-chat";
-        }
+        headers["Authorization"] = `Bearer ${token}`;
 
         // body 정리 (공통)
         let body = { ...requestBody };
@@ -785,7 +712,7 @@ const Interceptor = {
             delete body.include_reasoning;
             delete body.reasoning_effort;
 
-            // logprobs: 숫자 → boolean 변환 (Copilot API는 boolean만 허용)
+            // logprobs: 숫자 → boolean 변환 (일부 API는 boolean만 허용)
             if (body.logprobs != null && typeof body.logprobs !== "boolean") {
                 body.logprobs = !!body.logprobs;
                 DebugLog.info("logprobs 타입 변환: number → boolean");
@@ -895,7 +822,7 @@ const Interceptor = {
                 }
             }
 
-            // logprobs: 숫자 → boolean 변환 (Copilot API는 boolean만 허용)
+            // logprobs: 숫자 → boolean 변환 (일부 API는 boolean만 허용)
             if (body.logprobs != null && typeof body.logprobs !== "boolean") {
                 body.logprobs = !!body.logprobs;
                 DebugLog.info("logprobs 타입 변환: number → boolean");
@@ -1012,7 +939,7 @@ const Interceptor = {
             } catch (e) {
                 DebugLog.error("Anthropic 응답 변환 실패:", String(e));
                 return new Response(JSON.stringify({
-                    choices: [{ message: { role: "assistant", content: `[CPI] 응답 변환 오류: ${e.message}` }, index: 0, finish_reason: "stop" }],
+                    choices: [{ message: { role: "assistant", content: `[CFA] 응답 변환 오류: ${e.message}` }, index: 0, finish_reason: "stop" }],
                 }), { status: 200, headers: { "Content-Type": "application/json" } });
             }
         }
@@ -1213,7 +1140,7 @@ const Interceptor = {
             } catch (e) {
                 DebugLog.error("Anthropic 응답 JSON 파싱 실패:", String(e));
                 return new Response(JSON.stringify({
-                    choices: [{ message: { role: "assistant", content: "[CPI] 응답 파싱 실패" }, index: 0, finish_reason: "stop" }],
+                    choices: [{ message: { role: "assistant", content: "[CFA] 응답 파싱 실패" }, index: 0, finish_reason: "stop" }],
                 }), { status: 200, headers: { "Content-Type": "application/json" } });
             }
 
@@ -1512,19 +1439,20 @@ const Interceptor = {
                 requestBody = JSON.parse(bodyText);
             } catch { return self.originalFetch.apply(window, args); }
 
-            if (!(requestBody.custom_url || "").includes("githubcopilot.com")) return self.originalFetch.apply(window, args);
-            
+            // 전체 on/off: custom_url 이 있으면 처리 (연결 프로필 엔드포인트로 전송)
+            if (!(requestBody.custom_url || "").trim()) return self.originalFetch.apply(window, args);
+
             const token = getToken(requestBody);
-            if (!token) { DebugLog.warn("토큰 없음 — API key 또는 GCM 필요"); return self.originalFetch.apply(window, args); }
+            if (!token) { DebugLog.warn("토큰 없음 — 연결 프로필 API key 필요"); return self.originalFetch.apply(window, args); }
 
             DebugLog.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-            DebugLog.info("Copilot 요청 인터셉트!");
+            DebugLog.info("요청 인터셉트!");
 
             try {
                 return await self.interceptAndSend(requestBody);
             } catch (error) {
                 DebugLog.error("인터셉트 실패:", String(error));
-                toastr.error(`[CPI] ${error.message}`);
+                toastr.error(`[CFA] ${error.message}`);
                 try {
                     return await self.originalFetch.apply(window, args);
                 } catch {
@@ -1545,14 +1473,6 @@ const Interceptor = {
         this.active = false;
         DebugLog.info("인터셉터 제거됨");
     },
-
-    reset() {
-        this.sessionToken = "";
-        this.sessionTokenExpiry = 0;
-        this.machineId = "";
-        this.sessionId = "";
-        DebugLog.info("세션/토큰 초기화됨");
-    },
 };
 
 // ============================================================
@@ -1560,21 +1480,22 @@ const Interceptor = {
 // ============================================================
 function updateStatus() {
     const s = getSettings();
-    const el = $("#cpi_status");
+    const el = $("#cfa_status");
 
     if (!s.enabled) {
         el.text("❌ 비활성").css("color", "#f44336");
     } else if (!hasAnyToken()) {
-        el.text("⚠️ 토큰 없음 — API key 입력 또는 GCM 발급 필요").css("color", "#FF9800");
+        el.text("⚠️ 토큰 없음 — 연결 프로필 API key 입력 필요").css("color", "#FF9800");
     } else if (Interceptor.active) {
         const labels = {
-            "anthropic": "Anthropic (/v1/messages)",
-            "anthropic-thinking": "Anthropic 추론 (/v1/messages)",
-            "openai": "OpenAI (/chat/completions)",
-            "passthrough": "패스스루 (/chat/completions)",
-            "responses": "Responses (/responses)",
+            "anthropic": "Anthropic 포맷",
+            "anthropic-thinking": "Anthropic 추론 포맷",
+            "openai": "OpenAI 포맷",
+            "passthrough": "패스스루 (변환 없음)",
+            "responses": "Responses 포맷",
         };
-        el.text(`✅ 활성 — ${labels[s.endpoint] || s.endpoint}`).css("color", "#4CAF50");
+        const corr = s.pathCorrection ? " · 경로보정 ON" : "";
+        el.text(`✅ 활성 — ${labels[s.endpoint] || s.endpoint}${corr}`).css("color", "#4CAF50");
     } else {
         el.text("⚠️ 인터셉터 미설치").css("color", "#FF9800");
     }
@@ -1588,107 +1509,101 @@ jQuery(async () => {
     $("#extensions_settings").append(html);
 
     // 이벤트
-    $("#cpi_enabled").on("change", function () {
+    $("#cfa_enabled").on("change", function () {
         const s = getSettings();
         s.enabled = $(this).prop("checked");
         saveSettings();
         s.enabled ? Interceptor.install() : Interceptor.uninstall();
-        s.enabled ? toastr.success("[CPI] 활성화") : toastr.info("[CPI] 비활성화");
+        s.enabled ? toastr.success("[CFA] 활성화") : toastr.info("[CFA] 비활성화");
         updateStatus();
     });
 
-    $("#cpi_endpoint").on("change", function () {
+    $("#cfa_endpoint").on("change", function () {
         const s = getSettings();
         s.endpoint = $(this).val();
         saveSettings();
         DebugLog.info("엔드포인트:", s.endpoint);
-        $(".cpi-openai-only").toggle(s.endpoint === "openai" || s.endpoint === "responses");
-        $(".cpi-thinking-only").toggle(s.endpoint === "anthropic-thinking");
-        $(".cpi-passthrough-only").toggle(s.endpoint === "passthrough");
+        $(".cfa-openai-only").toggle(s.endpoint === "openai" || s.endpoint === "responses");
+        $(".cfa-thinking-only").toggle(s.endpoint === "anthropic-thinking");
+        $(".cfa-passthrough-only").toggle(s.endpoint === "passthrough");
         updateStatus();
     });
 
     // adaptive thinking
-    $("#cpi_adaptive_thinking").on("change", function () {
+    $("#cfa_adaptive_thinking").on("change", function () {
         const s = getSettings();
         s.adaptiveThinking = $(this).prop("checked");
         saveSettings();
-        $(".cpi-budget-row").toggle(!s.adaptiveThinking);
+        $(".cfa-budget-row").toggle(!s.adaptiveThinking);
         DebugLog.info("Adaptive Thinking:", s.adaptiveThinking ? "ON" : "OFF");
     });
 
     // thinking budget
-    $("#cpi_thinking_budget").on("change", function () {
+    $("#cfa_thinking_budget").on("change", function () {
         const s = getSettings();
         s.thinkingBudget = parseInt($(this).val()) || 10000;
         saveSettings();
         DebugLog.info("추론 budget:", s.thinkingBudget);
     });
 
-    $("#cpi_use_vscode_headers").on("change", function () {
-        const s = getSettings(); s.useVscodeHeaders = $(this).prop("checked"); saveSettings();
+    $("#cfa_path_correction").on("change", function () {
+        const s = getSettings(); s.pathCorrection = $(this).prop("checked"); saveSettings();
+        DebugLog.info("경로 보정:", s.pathCorrection ? "ON" : "OFF");
     });
-    $("#cpi_remove_prefill").on("change", function () {
+    $("#cfa_remove_prefill").on("change", function () {
         const s = getSettings(); s.removePrefill = $(this).prop("checked"); saveSettings();
         DebugLog.info("프리필 제거:", s.removePrefill ? "ON" : "OFF");
     });
-    $("#cpi_trim_assistant").on("change", function () {
+    $("#cfa_trim_assistant").on("change", function () {
         const s = getSettings(); s.trimAssistant = $(this).prop("checked"); saveSettings();
         DebugLog.info("assistant trim:", s.trimAssistant ? "ON" : "OFF");
     });
-    $("#cpi_force_last_user").on("change", function () {
+    $("#cfa_force_last_user").on("change", function () {
         const s = getSettings(); s.forceLastUser = $(this).prop("checked"); saveSettings();
         DebugLog.info("마지막 user 강제:", s.forceLastUser ? "ON" : "OFF");
     });
-    $("#cpi_basic_auth_compat").on("change", function () {
+    $("#cfa_basic_auth_compat").on("change", function () {
         const s = getSettings(); s.basicAuthCompat = $(this).prop("checked"); saveSettings();
         DebugLog.info("basicAuth:", s.basicAuthCompat ? "ON" : "OFF");
     });
-    $("#cpi_debug_log").on("change", function () {
+    $("#cfa_debug_log").on("change", function () {
         const s = getSettings(); s.debugLog = $(this).prop("checked"); saveSettings();
-        s.debugLog ? $("#cpi_log_panel").slideDown(150) && DebugLog.render() : $("#cpi_log_panel").slideUp(150);
+        s.debugLog ? $("#cfa_log_panel").slideDown(150) && DebugLog.render() : $("#cfa_log_panel").slideUp(150);
     });
-    $("#cpi_chat_version").on("change", function () {
-        const s = getSettings(); s.chatVersion = $(this).val().trim() || "0.38.2026020704"; saveSettings(); Interceptor.reset();
-    });
-    $("#cpi_code_version").on("change", function () {
-        const s = getSettings(); s.codeVersion = $(this).val().trim() || "1.109.0"; saveSettings(); Interceptor.reset();
-    });
-    $("#cpi_reset_session").on("click", () => { Interceptor.reset(); toastr.info("[CPI] 세션 초기화"); updateStatus(); });
-    $("#cpi_clear_log").on("click", () => { DebugLog.clear(); toastr.info("[CPI] 로그 초기화"); });
+    $("#cfa_clear_log").on("click", () => { DebugLog.clear(); toastr.info("[CFA] 로그 초기화"); });
 
     // 접기/펼치기 이벤트 위임
-    $("#cpi_log_content").on("click", ".cpi-fold-btn", function () {
-        const fold = $(this).closest(".cpi-fold");
+    $("#cfa_log_content").on("click", ".cfa-fold-btn", function () {
+        const fold = $(this).closest(".cfa-fold");
         const action = $(this).data("action");
         if (action === "expand") {
-            fold.find(".cpi-fold-short").hide();
-            fold.find(".cpi-fold-long").show();
+            fold.find(".cfa-fold-short").hide();
+            fold.find(".cfa-fold-long").show();
         } else {
-            fold.find(".cpi-fold-long").hide();
-            fold.find(".cpi-fold-short").show();
+            fold.find(".cfa-fold-long").hide();
+            fold.find(".cfa-fold-short").show();
         }
     });
 
     // 맨 아래로 스크롤
-    $("#cpi_scroll_bottom").on("click", () => {
-        const el = $("#cpi_log_content");
+    $("#cfa_scroll_bottom").on("click", () => {
+        const el = $("#cfa_log_content");
         el.scrollTop(el[0]?.scrollHeight || 0);
     });
 
     // 모두 접기
-    $("#cpi_fold_all").on("click", function () {
-        const el = $("#cpi_log_content");
-        const isAllFolded = el.find(".cpi-fold-long:visible").length === 0;
+    $("#cfa_fold_all").on("click", function () {
+        const el = $("#cfa_log_content");
+        const isAllFolded = el.find(".cfa-fold-long:visible").length === 0;
         if (isAllFolded) {
             // 모두 펼치기
-            el.find(".cpi-fold-short").hide();
-            el.find(".cpi-fold-long").show();
+            el.find(".cfa-fold-short").hide();
+            el.find(".cfa-fold-long").show();
             $(this).val("📁 모두 접기");
         } else {
             // 모두 접기
-            el.find(".cpi-fold-long").hide();
-            el.find(".cpi-fold-short").show();
+            el.find(".cfa-fold-long").hide();
+            el.find(".cfa-fold-short").show();
             $(this).val("📂 모두 펼치기");
         }
     });
@@ -1696,16 +1611,16 @@ jQuery(async () => {
     // 토큰 보관 시스템
     function renderTokenSelect() {
         const s = getSettings();
-        const sel = $("#cpi_token_select");
+        const sel = $("#cfa_token_select");
         sel.empty();
-        sel.append(`<option value="">-- 토큰 선택 (비어있으면 GCM 폴백) --</option>`);
+        sel.append(`<option value="">-- 키 선택 (비우면 연결 프로필 키 사용) --</option>`);
         (s.tokens || []).forEach((t, i) => {
             const masked = t.value.substring(0, 8) + "...";
             sel.append(`<option value="${i}" ${s.token === t.value ? "selected" : ""}>${t.name} (${masked})</option>`);
         });
     }
 
-    $("#cpi_token_select").on("change", function () {
+    $("#cfa_token_select").on("change", function () {
         const s = getSettings();
         const idx = $(this).val();
         if (idx === "" || idx === null) {
@@ -1715,37 +1630,37 @@ jQuery(async () => {
         }
         saveSettings();
         updateStatus();
-        DebugLog.info(s.token ? `토큰 선택: ${s.token.substring(0, 10)}...` : "토큰 해제 (GCM 폴백)");
+        DebugLog.info(s.token ? `키 선택: ${s.token.substring(0, 10)}...` : "키 해제 (연결 프로필 키 사용)");
     });
 
-    $("#cpi_token_add").on("click", function () {
+    $("#cfa_token_add").on("click", function () {
         const s = getSettings();
-        const name = $("#cpi_token_name").val().trim();
-        const value = $("#cpi_token_value").val().trim();
-        if (!value) { toastr.warning("[CPI] 토큰을 입력하세요"); return; }
+        const name = $("#cfa_token_name").val().trim();
+        const value = $("#cfa_token_value").val().trim();
+        if (!value) { toastr.warning("[CFA] 토큰을 입력하세요"); return; }
         if (!s.tokens) s.tokens = [];
         s.tokens.push({ name: name || `토큰 ${s.tokens.length + 1}`, value });
         s.token = value;
         saveSettings();
         renderTokenSelect();
         updateStatus();
-        $("#cpi_token_name").val("");
-        $("#cpi_token_value").val("");
-        toastr.success(`[CPI] 토큰 추가: ${name || "토큰"}`);
+        $("#cfa_token_name").val("");
+        $("#cfa_token_value").val("");
+        toastr.success(`[CFA] 토큰 추가: ${name || "토큰"}`);
         DebugLog.info(`토큰 추가: ${name} (${value.substring(0, 10)}...)`);
     });
 
-    $("#cpi_token_delete").on("click", function () {
+    $("#cfa_token_delete").on("click", function () {
         const s = getSettings();
-        const idx = $("#cpi_token_select").val();
-        if (idx === "" || idx === null) { toastr.warning("[CPI] 삭제할 토큰을 선택하세요"); return; }
+        const idx = $("#cfa_token_select").val();
+        if (idx === "" || idx === null) { toastr.warning("[CFA] 삭제할 토큰을 선택하세요"); return; }
         const i = parseInt(idx);
         const removed = s.tokens.splice(i, 1)[0];
         if (s.token === removed.value) s.token = "";
         saveSettings();
         renderTokenSelect();
         updateStatus();
-        toastr.info(`[CPI] 토큰 삭제: ${removed.name}`);
+        toastr.info(`[CFA] 토큰 삭제: ${removed.name}`);
         DebugLog.info(`토큰 삭제: ${removed.name}`);
     });
 
@@ -1755,28 +1670,26 @@ jQuery(async () => {
         if (s[k] === undefined) s[k] = v;
     }
 
-    $("#cpi_enabled").prop("checked", s.enabled);
-    $("#cpi_endpoint").val(s.endpoint);
+    $("#cfa_enabled").prop("checked", s.enabled);
+    $("#cfa_endpoint").val(s.endpoint);
     renderTokenSelect();
-    $("#cpi_thinking_budget").val(s.thinkingBudget || 10000);
-    $("#cpi_adaptive_thinking").prop("checked", !!s.adaptiveThinking);
-    $(".cpi-budget-row").toggle(!s.adaptiveThinking);
+    $("#cfa_thinking_budget").val(s.thinkingBudget || 10000);
+    $("#cfa_adaptive_thinking").prop("checked", !!s.adaptiveThinking);
+    $(".cfa-budget-row").toggle(!s.adaptiveThinking);
 
-    $("#cpi_use_vscode_headers").prop("checked", s.useVscodeHeaders);
-    $("#cpi_remove_prefill").prop("checked", s.removePrefill);
-    $("#cpi_trim_assistant").prop("checked", s.trimAssistant);
-    $("#cpi_force_last_user").prop("checked", s.forceLastUser);
-    $("#cpi_basic_auth_compat").prop("checked", s.basicAuthCompat);
-    $("#cpi_debug_log").prop("checked", s.debugLog);
-    $("#cpi_chat_version").val(s.chatVersion);
-    $("#cpi_code_version").val(s.codeVersion);
+    $("#cfa_remove_prefill").prop("checked", s.removePrefill);
+    $("#cfa_trim_assistant").prop("checked", s.trimAssistant);
+    $("#cfa_force_last_user").prop("checked", s.forceLastUser);
+    $("#cfa_basic_auth_compat").prop("checked", s.basicAuthCompat);
+    $("#cfa_debug_log").prop("checked", s.debugLog);
+    $("#cfa_path_correction").prop("checked", s.pathCorrection);
 
-    $(".cpi-openai-only").toggle(s.endpoint === "openai" || s.endpoint === "responses");
-    $(".cpi-thinking-only").toggle(s.endpoint === "anthropic-thinking");
-    $(".cpi-passthrough-only").toggle(s.endpoint === "passthrough");
-    if (!s.debugLog) $("#cpi_log_panel").hide();
+    $(".cfa-openai-only").toggle(s.endpoint === "openai" || s.endpoint === "responses");
+    $(".cfa-thinking-only").toggle(s.endpoint === "anthropic-thinking");
+    $(".cfa-passthrough-only").toggle(s.endpoint === "passthrough");
+    if (!s.debugLog) $("#cfa_log_panel").hide();
 
     if (s.enabled) Interceptor.install();
     updateStatus();
-    DebugLog.info("CPI 로드 완료");
+    DebugLog.info("CFA 로드 완료");
 });
